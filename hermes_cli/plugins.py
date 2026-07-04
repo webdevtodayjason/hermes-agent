@@ -157,6 +157,21 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # API-error classification override. Fired once per failed API call at
+    # the top of ``agent/error_classifier.classify_api_error()``, BEFORE the
+    # built-in pipeline, so provider plugins can own their provider's error
+    # quirks without core patches. Callbacks receive the parsed error context
+    # (provider, model, status_code, error_type, error_code, error_message,
+    # error_body, error, approx_tokens, context_length, num_messages) and
+    # should self-scope on ``provider``. Return None to pass, or a dict::
+    #   {"reason": "<FailoverReason name>",          # required
+    #    "retryable": bool, "should_compress": bool,
+    #    "should_rotate_credential": bool, "should_fallback": bool,
+    #    "message": str, "error_context": dict}      # all optional
+    # First valid result (registration order) wins. Invalid dicts and
+    # unknown reasons are skipped; exceptions are isolated — a broken
+    # plugin can never break error classification.
+    "classify_api_error",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1105,6 +1120,50 @@ class PluginContext:
             key,
             display_name,
         )
+
+    # -- redaction pattern registration --------------------------------------
+
+    def register_redaction_patterns(self, patterns) -> int:
+        """Additively register secret-token regexes with the redaction engine.
+
+        Accepted patterns join the vendor-prefix alternation in
+        :mod:`agent.redact` and are masked everywhere built-in patterns
+        apply — logs, terminal output, transport errors, transcripts —
+        with the same head/tail masking and the same non-reusable
+        sentinel on ``file_read`` content. Historically every new vendor
+        token format required a core PR appending to
+        ``_PREFIX_PATTERNS``; provider plugins should own their own
+        format instead.
+
+        The registry is **additive-only**: plugins can extend what gets
+        masked but cannot remove or weaken built-in patterns, so a
+        plugin can only ever over-redact, never expose. The operator's
+        global opt-out (``security.redact_secrets: false``) applies to
+        plugin patterns exactly as it does to built-ins.
+
+        Each pattern must compile as a regex and start with at least 2
+        literal characters (e.g. ``r"nvapi-[A-Za-z0-9_-]{20,}"``).
+        Invalid entries are warned and skipped — never raised.
+
+        Returns the number of patterns accepted.
+        """
+        from agent.redact import register_redaction_patterns as _register
+
+        try:
+            count = _register(
+                patterns, source=f"plugin:{self.manifest.name}",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Plugin '%s' redaction pattern registration failed: %s",
+                self.manifest.name, exc,
+            )
+            return 0
+        logger.debug(
+            "Plugin %s registered %d redaction pattern(s)",
+            self.manifest.name, count,
+        )
+        return count
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a lifecycle hook callback.
@@ -2143,6 +2202,87 @@ def get_pre_verify_continue_message(
         message = result.get("message") or result.get("reason")
         if isinstance(message, str) and message.strip():
             return message.strip()
+
+    return None
+
+
+def get_plugin_error_classification(
+    *,
+    provider: str = "",
+    model: str = "",
+    status_code: Optional[int] = None,
+    error_type: str = "",
+    error_code: str = "",
+    error_message: str = "",
+    error_body: Optional[Dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+    approx_tokens: int = 0,
+    context_length: int = 0,
+    num_messages: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """Check ``classify_api_error`` hooks for a classification directive.
+
+    Consulted by :func:`agent.error_classifier.classify_api_error` BEFORE
+    its built-in pipeline, so a provider plugin can both add classifications
+    the core patterns miss and correct ones they get wrong for its provider.
+
+    A callback returns ``None`` to pass, or a dict with a required
+    ``"reason"`` (a :class:`agent.error_classifier.FailoverReason` member or
+    its string name) plus optional recovery-hint overrides. The first result
+    carrying a valid reason wins — mirroring
+    :func:`get_pre_tool_call_block_message`, invalid or irrelevant returns
+    are silently ignored so a misbehaving plugin degrades to a no-op.
+
+    Returns a sanitized dict (``reason`` coerced to ``FailoverReason``, hint
+    fields coerced to ``bool``) or ``None`` when no plugin claimed the error.
+    """
+    from agent.error_classifier import FailoverReason
+
+    hook_results = invoke_hook(
+        "classify_api_error",
+        provider=provider,
+        model=model,
+        status_code=status_code,
+        error_type=error_type,
+        error_code=error_code,
+        error_message=error_message,
+        error_body=error_body if isinstance(error_body, dict) else {},
+        error=error,
+        approx_tokens=approx_tokens,
+        context_length=context_length,
+        num_messages=num_messages,
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        reason_raw = result.get("reason")
+        if isinstance(reason_raw, FailoverReason):
+            reason = reason_raw
+        elif isinstance(reason_raw, str):
+            try:
+                reason = FailoverReason(reason_raw.strip().lower())
+            except ValueError:
+                continue
+        else:
+            continue
+
+        out: Dict[str, Any] = {"reason": reason}
+        for key in (
+            "retryable",
+            "should_compress",
+            "should_rotate_credential",
+            "should_fallback",
+        ):
+            if key in result:
+                out[key] = bool(result[key])
+        message = result.get("message")
+        if isinstance(message, str) and message.strip():
+            out["message"] = message.strip()[:500]
+        error_context = result.get("error_context")
+        if isinstance(error_context, dict):
+            out["error_context"] = error_context
+        return out
 
     return None
 
