@@ -62,7 +62,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.run_service import RunRegistry
+from gateway.run_service import RunService, RunSubscriberLimitError
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -74,6 +74,74 @@ from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+
+class _APIRunExecutionHooks:
+    """Bridge API-specific agent/session seams into the pure run service."""
+
+    def __init__(self, adapter: "APIServerAdapter"):
+        self._adapter = adapter
+
+    def create_agent(self, **kwargs: Any) -> Any:
+        return self._adapter._create_agent(**kwargs)
+
+    def bind_session(self, session_key: str) -> list[Any]:
+        return self._adapter._bind_api_server_session(session_key=session_key)
+
+    @staticmethod
+    def clear_session(tokens: list[Any]) -> None:
+        from gateway.session_context import clear_session_vars
+
+        clear_session_vars(tokens)
+
+    def activate_admitted_request(self) -> None:
+        self._adapter._activate_admitted_request()
+
+    @staticmethod
+    def register_approval_notify(session_key: str, callback: Any) -> None:
+        from tools.approval import register_gateway_notify
+
+        register_gateway_notify(session_key, callback)
+
+    @staticmethod
+    def unregister_approval_notify(session_key: str) -> None:
+        from tools.approval import unregister_gateway_notify
+
+        unregister_gateway_notify(session_key)
+
+    @staticmethod
+    def set_approval_session(session_key: str) -> Any:
+        from tools.approval import set_current_session_key
+
+        return set_current_session_key(session_key)
+
+    @staticmethod
+    def reset_approval_session(token: Any) -> None:
+        from tools.approval import reset_current_session_key
+
+        reset_current_session_key(token)
+
+    @staticmethod
+    def redact_error(value: Any) -> str:
+        return _redact_api_error_text(value)
+
+    @staticmethod
+    def redact_approval_command(value: Any) -> str:
+        from gateway.run import _redact_approval_command
+
+        return _redact_approval_command(value)
+
+    @staticmethod
+    def interrupt_agent(agent: Any) -> None:
+        agent.interrupt("Stop requested via API")
+
+    def track_task(self, task: "asyncio.Task[Any]") -> None:
+        try:
+            self._adapter._background_tasks.add(task)
+        except TypeError:
+            pass
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._adapter._background_tasks.discard)
 
 
 def _hermes_version() -> str:
@@ -948,18 +1016,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
-        # Creation timestamps for orphaned-run TTL sweep
-        self._run_streams_created: Dict[str, float] = {}
-        # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
-        # Retained status and stop-control references share one lock-aware owner.
-        self._run_registry = RunRegistry()
-        # Active approval session key for each run_id.  The approval core
-        # resolves requests by session key, while API clients address the
-        # in-flight run by run_id.
-        self._run_approval_sessions: Dict[str, str] = {}
+        # Execution, retained status, control references, and lifecycle event
+        # queues share one transport-neutral owner.
+        self._run_service = RunService(_APIRunExecutionHooks(self))
+        self._run_registry = self._run_service.registry
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -4292,55 +4352,25 @@ class APIServerAdapter(BasePlatformAdapter):
     def _stopping_run_ids(self) -> MutableSet[str]:
         return self._run_registry.stopping_ids
 
+    @property
+    def _run_streams(self) -> Dict[str, "asyncio.Queue[Optional[Dict]]"]:
+        return self._run_service.streams
+
+    @property
+    def _run_streams_created(self) -> Dict[str, float]:
+        return self._run_service.streams_created
+
+    @property
+    def _run_stream_subscribers(self) -> set[str]:
+        return self._run_service.stream_subscribers
+
+    @property
+    def _run_approval_sessions(self) -> Dict[str, str]:
+        return self._run_service.approval_sessions
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         return self._run_registry.set_status(run_id, status, **fields)
-
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_registry.status_value(run_id, "status", "running"),
-                last_event=event.get("event"),
-            )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
-
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-            ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
-            elif event_type == "reasoning.available":
-                _push({
-                    "event": "reasoning.available",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "text": preview or "",
-                })
-            # _thinking and subagent_progress are intentionally not forwarded
-
-        return _callback
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -4416,277 +4446,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
-        # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
-        approval_session_key = run_id
-        ephemeral_system_prompt = instructions
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
-        self._run_approval_sessions[run_id] = approval_session_key
-
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
-
-        # Also wire stream_delta_callback so message.delta events flow through.
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            if run_id not in self._run_streams:
-                return
-            try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
-
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
+        session_id = body.get("session_id") or stored_session_id
+        run_id = self._run_service.start(
+            user_message=user_message,
+            conversation_history=conversation_history,
+            session_id=session_id or "",
             model=body.get("model", self._model_name),
+            ephemeral_system_prompt=instructions,
+            gateway_session_key=gateway_session_key,
+            route=self._resolve_route(body.get("model")),
         )
-
-        # Per-client model routing for /v1/runs (see model_routes).
-        route = self._resolve_route(body.get("model"))
-
-        async def _run_and_close():
-            try:
-                self._set_run_status(run_id, "running")
-                if self._run_registry.is_stopping(run_id):
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
-                    return
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                    gateway_session_key=gateway_session_key,
-                    route=route,
-                )
-                if not self._run_registry.register_agent(run_id, agent):
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
-                    return
-
-                def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
-
-                def _run_sync():
-                    from gateway.session_context import clear_session_vars
-                    from tools.approval import (
-                        register_gateway_notify,
-                        reset_current_session_key,
-                        set_current_session_key,
-                        unregister_gateway_notify,
-                    )
-
-                    effective_task_id = session_id or run_id
-                    approval_token = None
-                    session_tokens = []
-                    try:
-                        # Bind approval/session identity for this API run via
-                        # contextvars so concurrent runs do not share process
-                        # environment state.
-                        approval_token = set_current_session_key(approval_session_key)
-                        session_tokens = self._bind_api_server_session(
-                            session_key=approval_session_key,
-                        )
-                        register_gateway_notify(approval_session_key, _approval_notify)
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
-                        )
-                    finally:
-                        try:
-                            unregister_gateway_notify(approval_session_key)
-                        finally:
-                            if approval_token is not None:
-                                try:
-                                    reset_current_session_key(approval_token)
-                                except Exception:
-                                    pass
-                            if session_tokens:
-                                try:
-                                    clear_session_vars(session_tokens)
-                                except Exception:
-                                    pass
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
-
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                if self._run_registry.is_stopping(run_id):
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
-                # Check for structured failure (non-retryable client errors like
-                # 401/400 return failed=True instead of raising, so the except
-                # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": error_msg,
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "failed",
-                        error=error_msg,
-                        last_event="run.failed",
-                    )
-                else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    _put_event_if_active({
-                        "event": "run.completed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "output": final_response,
-                        "usage": usage,
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
-                    )
-            except asyncio.CancelledError:
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
-                raise
-            except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=_redact_api_error_text(exc),
-                    last_event="run.failed",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
-                    })
-                except Exception:
-                    pass
-            finally:
-                # If the asyncio wrapper is cancelled (for example via
-                # /stop), the executor thread can still be blocked waiting
-                # on an approval Event.  Unregistering here releases those
-                # waits immediately; the in-thread unregister is harmlessly
-                # idempotent on normal completion.
-                try:
-                    from tools.approval import unregister_gateway_notify
-
-                    unregister_gateway_notify(approval_session_key)
-                except Exception:
-                    pass
-                # Sentinel: signal SSE stream to close
-                try:
-                    _put_event_if_active(None)
-                except Exception:
-                    pass
-                self._run_registry.remove_control(run_id)
-                self._run_approval_sessions.pop(run_id, None)
-
-        self._activate_admitted_request()
-        task = asyncio.create_task(_run_and_close())
-        self._run_registry.register_task(run_id, task)
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            pass
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
-
         response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
+            {"X-Hermes-Session-Key": gateway_session_key}
+            if gateway_session_key
+            else {}
         )
         return web.json_response(
             {"run_id": run_id, "status": "started"},
@@ -4708,7 +4481,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return web.json_response({
             "object": "list",
-            "data": self._run_registry.list_for_session(session_id),
+            "data": self._run_service.list(session_id),
         })
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
@@ -4718,8 +4491,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        expected_session_id = str(request.query.get("session_id") or "").strip() or None
-        status = self._run_registry.get(run_id, expected_session_id)
+        expected_session_id = str(request.query.get("session_id") or "").strip()
+        if not expected_session_id:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        status = self._run_service.status(run_id, expected_session_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -4734,17 +4512,36 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        expected_session_id = str(request.query.get("session_id") or "").strip()
+        if not expected_session_id:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
-            if run_id in self._run_streams:
+            if self._run_service.stream_for(run_id, expected_session_id) is not None:
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
+        try:
+            q = self._run_service.subscribe(run_id, expected_session_id)
+        except RunSubscriberLimitError:
+            return web.json_response(
+                _openai_error(
+                    "Run event subscriber limit reached",
+                    code="run_subscriber_limit",
+                ),
+                status=429,
+            )
+        if q is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         response = web.StreamResponse(
             status=200,
@@ -4772,9 +4569,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            self._run_service.unsubscribe(run_id, q)
 
         return response
 
@@ -4786,7 +4581,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        if not self._run_registry.contains(run_id):
+        expected_session_id = str(request.query.get("session_id") or "").strip()
+        if not expected_session_id or self._run_service.status(
+            run_id, expected_session_id
+        ) is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -4810,7 +4608,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        approval_session_key = self._run_approval_sessions.get(run_id)
+        approval_session_key = self._run_service.approval_session_for(
+            run_id, expected_session_id
+        )
         if not approval_session_key:
             return web.json_response(
                 _openai_error(
@@ -4845,19 +4645,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
+        published = self._run_service.publish_approval_response(
+            run_id,
+            expected_session_id=expected_session_id,
+            choice=choice,
+            resolved=resolved,
+        )
+        if not published:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         return web.json_response({
             "object": "hermes.run.approval_response",
@@ -4873,36 +4671,34 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        expected_session_id = None
-        if request.can_read_body:
-            try:
-                body = await request.json()
-            except Exception:
-                return web.json_response(_openai_error("Invalid JSON"), status=400)
-            if not isinstance(body, dict):
-                return web.json_response(
-                    _openai_error("JSON body must be an object"),
-                    status=400,
-                )
-            expected_session_id = str(body.get("session_id") or "").strip() or None
-
-        target = self._run_registry.claim_stop_target(run_id, expected_session_id)
-        if target is None:
+        if not request.can_read_body:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        if target.owns_lease:
-            try:
-                if target.agent is not None:
-                    try:
-                        target.agent.interrupt("Stop requested via API")
-                    except Exception:
-                        pass
-            finally:
-                self._run_registry.release_stop_target(run_id)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("JSON body must be an object"),
+                status=400,
+            )
+        expected_session_id = str(body.get("session_id") or "").strip()
+        if not expected_session_id:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+        result = self._run_service.stop(run_id, expected_session_id)
+        if result is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        return web.json_response(result)
 
     def _register_run_routes(self, app: Any) -> None:
         """Register the canonical run collection and lifecycle routes."""
@@ -4923,34 +4719,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """Expire old SSE buffers without treating transport age as run age."""
         if now is None:
             now = time.time()
-        stale = [
-            run_id
-            for run_id, created_at in list(self._run_streams_created.items())
-            if now - created_at > self._RUN_STREAM_TTL
-            and run_id not in self._run_stream_subscribers
-        ]
-        for run_id in stale:
-            logger.debug("[api_server] sweeping expired run transport %s", run_id)
-            task = self._run_registry.task_for(run_id)
-            task_done = task is None or task.done()
-            if task_done:
-                try:
-                    from tools.approval import unregister_gateway_notify
-
-                    approval_session_key = self._run_approval_sessions.get(run_id)
-                    if approval_session_key:
-                        unregister_gateway_notify(approval_session_key)
-                except Exception:
-                    pass
-            # The transport TTL always bounds buffering. Live control state is
-            # independent and survives until the executor-backed task returns.
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
-            if task_done:
-                self._run_registry.remove_control(run_id)
-                self._run_approval_sessions.pop(run_id, None)
-
-        self._run_registry.expire_terminal_statuses(now, self._RUN_STATUS_TTL)
+        self._run_service.sweep(
+            now,
+            stream_ttl=self._RUN_STREAM_TTL,
+            status_ttl=self._RUN_STATUS_TTL,
+        )
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

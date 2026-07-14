@@ -144,7 +144,7 @@ def test_run_routes_register_get_and_post_on_the_canonical_collection():
 @pytest.mark.anyio
 async def test_list_runs_requires_the_api_bearer_key():
     adapter = APIServerAdapter(
-        PlatformConfig(enabled=True, extra={"key": "sk-con...cret"})
+        PlatformConfig(enabled=True, extra={"key": "sk-conversation-secret"})
     )
     adapter._set_run_status(
         "run_private",
@@ -157,7 +157,7 @@ async def test_list_runs_requires_the_api_bearer_key():
         unauthenticated = await client.get("/v1/runs")
         authenticated = await client.get(
             "/v1/runs?session_id=conversation-private",
-            headers={"Authorization": "Bearer sk-con...cret"},
+            headers={"Authorization": "Bearer sk-conversation-secret"},
         )
 
         assert unauthenticated.status == 401
