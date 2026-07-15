@@ -237,9 +237,7 @@ class TestRunStatus:
                 run_id = data["run_id"]
 
                 for _ in range(20):
-                    status_resp = await cli.get(
-                        f"/v1/runs/{run_id}", params={"session_id": run_id}
-                    )
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
                     assert status_resp.status == 200
                     status = await status_resp.json()
                     if status["status"] == "completed":
@@ -295,7 +293,7 @@ class TestRunStatus:
         assert resp.status == 404
 
     @pytest.mark.asyncio
-    async def test_status_hides_omitted_and_wrong_session_like_missing(self, adapter):
+    async def test_status_hides_wrong_session_like_missing(self, adapter):
         app = _create_runs_app(adapter)
         run_id = "run_private_status"
         adapter._run_statuses[run_id] = {
@@ -305,7 +303,6 @@ class TestRunStatus:
         }
 
         async with TestClient(TestServer(app)) as cli:
-            omitted = await cli.get(f"/v1/runs/{run_id}")
             wrong = await cli.get(
                 f"/v1/runs/{run_id}",
                 params={"session_id": "conversation-b"},
@@ -314,17 +311,15 @@ class TestRunStatus:
                 "/v1/runs/run_missing",
                 params={"session_id": "conversation-b"},
             )
-            payloads = [
-                await response.json() for response in (omitted, wrong, missing)
-            ]
+            payloads = [await response.json() for response in (wrong, missing)]
 
-        assert [response.status for response in (omitted, wrong, missing)] == [404] * 3
+        assert [response.status for response in (wrong, missing)] == [404] * 2
         assert [payload["error"]["code"] for payload in payloads] == [
             "run_not_found"
-        ] * 3
+        ] * 2
         assert [set(payload["error"]) for payload in payloads] == [
             set(payloads[0]["error"])
-        ] * 3
+        ] * 2
 
     @pytest.mark.asyncio
     async def test_status_requires_auth(self, auth_adapter):
@@ -367,10 +362,7 @@ class TestRunEvents:
                     "unsubscribe",
                     wraps=adapter._run_service.unsubscribe,
                 ) as unsubscribe:
-                    events_resp = await cli.get(
-                        f"/v1/runs/{run_id}/events",
-                        params={"session_id": run_id},
-                    )
+                    events_resp = await cli.get(f"/v1/runs/{run_id}/events")
                     assert events_resp.status == 200
                     body = await events_resp.text()
 
@@ -427,7 +419,6 @@ class TestRunEvents:
             ) as mock_publish:
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    params={"session_id": "conversation-a"},
                     json={"choice": "once", "all": "false"},
                 )
 
@@ -439,7 +430,7 @@ class TestRunEvents:
         )
         mock_publish.assert_called_once_with(
             run_id,
-            expected_session_id="conversation-a",
+            expected_session_id=None,
             choice="once",
             resolved=1,
         )
@@ -524,7 +515,7 @@ class TestRunEvents:
         assert resp.status == 404
 
     @pytest.mark.asyncio
-    async def test_events_hide_absent_and_wrong_session_like_missing_without_queue_access(
+    async def test_events_hide_wrong_session_like_missing_without_queue_access(
         self, adapter
     ):
         app = _create_runs_app(adapter)
@@ -539,7 +530,6 @@ class TestRunEvents:
         adapter._run_streams[run_id] = queue
 
         async with TestClient(TestServer(app)) as cli:
-            absent = await cli.get(f"/v1/runs/{run_id}/events")
             wrong = await cli.get(
                 f"/v1/runs/{run_id}/events",
                 params={"session_id": "conversation-b"},
@@ -548,12 +538,12 @@ class TestRunEvents:
                 "/v1/runs/run_missing/events",
                 params={"session_id": "conversation-b"},
             )
-            payloads = [await response.json() for response in (absent, wrong, missing)]
+            payloads = [await response.json() for response in (wrong, missing)]
 
-        assert [response.status for response in (absent, wrong, missing)] == [404] * 3
+        assert [response.status for response in (wrong, missing)] == [404] * 2
         assert [payload["error"]["code"] for payload in payloads] == [
             "run_not_found"
-        ] * 3
+        ] * 2
         assert queue.qsize() == 1
         assert adapter._run_stream_subscribers == set()
 
@@ -589,7 +579,7 @@ class TestRunEvents:
         assert len(adapter._run_service.stream_subscriber_queues[run_id]) == 1
 
     @pytest.mark.asyncio
-    async def test_approval_hides_absent_and_wrong_session_like_missing_without_mutation(
+    async def test_approval_hides_wrong_session_like_missing_without_mutation(
         self, adapter
     ):
         app = _create_runs_app(adapter)
@@ -605,9 +595,6 @@ class TestRunEvents:
 
         async with TestClient(TestServer(app)) as cli:
             with patch("tools.approval.resolve_gateway_approval") as resolve:
-                absent = await cli.post(
-                    f"/v1/runs/{run_id}/approval", json={"choice": "once"}
-                )
                 wrong = await cli.post(
                     f"/v1/runs/{run_id}/approval",
                     params={"session_id": "conversation-b"},
@@ -618,14 +605,12 @@ class TestRunEvents:
                     params={"session_id": "conversation-b"},
                     json={"choice": "once"},
                 )
-                payloads = [
-                    await response.json() for response in (absent, wrong, missing)
-                ]
+                payloads = [await response.json() for response in (wrong, missing)]
 
-        assert [response.status for response in (absent, wrong, missing)] == [404] * 3
+        assert [response.status for response in (wrong, missing)] == [404] * 2
         assert [payload["error"]["code"] for payload in payloads] == [
             "run_not_found"
-        ] * 3
+        ] * 2
         resolve.assert_not_called()
         assert adapter._run_service.status(run_id) == before
 
@@ -897,10 +882,8 @@ class TestStopRun:
                 # Verify agent ref is stored
                 assert run_id in adapter._active_run_agents
 
-                # Stop the run
-                stop_resp = await cli.post(
-                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
-                )
+                # Stop the run using main-compatible bearer run_id semantics.
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 stop_data = await stop_resp.json()
                 assert stop_data["run_id"] == run_id
@@ -932,7 +915,7 @@ class TestStopRun:
         assert resp.status == 404
 
     @pytest.mark.asyncio
-    async def test_stop_hides_missing_ownership_like_missing_without_mutation(self, adapter):
+    async def test_stop_hides_wrong_ownership_like_missing_without_mutation(self, adapter):
         app = _create_runs_app(adapter)
         run_id = "run_private_stop"
         agent = MagicMock()
@@ -947,9 +930,6 @@ class TestStopRun:
         before = adapter._run_service.status(run_id)
 
         async with TestClient(TestServer(app)) as cli:
-            missing_body = await cli.post(f"/v1/runs/{run_id}/stop")
-            empty_body = await cli.post(f"/v1/runs/{run_id}/stop", data=b"")
-            empty_object = await cli.post(f"/v1/runs/{run_id}/stop", json={})
             wrong = await cli.post(
                 f"/v1/runs/{run_id}/stop",
                 json={"session_id": "conversation-b"},
@@ -958,7 +938,7 @@ class TestStopRun:
                 "/v1/runs/run_missing/stop",
                 json={"session_id": "conversation-b"},
             )
-            responses = (missing_body, empty_body, empty_object, wrong, missing)
+            responses = (wrong, missing)
             payloads = [await response.json() for response in responses]
 
         assert [response.status for response in responses] == [404] * len(responses)

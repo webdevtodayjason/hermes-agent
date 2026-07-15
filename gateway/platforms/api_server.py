@@ -4492,12 +4492,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         expected_session_id = str(request.query.get("session_id") or "").strip()
-        if not expected_session_id:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-        status = self._run_service.status(run_id, expected_session_id)
+        status = self._run_service.status(run_id, expected_session_id or None)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -4513,22 +4508,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         expected_session_id = str(request.query.get("session_id") or "").strip()
-        if not expected_session_id:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
+        owner_filter = expected_session_id or None
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
-            if self._run_service.stream_for(run_id, expected_session_id) is not None:
+            if self._run_service.stream_for(run_id, owner_filter) is not None:
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         try:
-            q = self._run_service.subscribe(run_id, expected_session_id)
+            q = self._run_service.subscribe(run_id, owner_filter)
         except RunSubscriberLimitError:
             return web.json_response(
                 _openai_error(
@@ -4582,9 +4573,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         expected_session_id = str(request.query.get("session_id") or "").strip()
-        if not expected_session_id or self._run_service.status(
-            run_id, expected_session_id
-        ) is None:
+        owner_filter = expected_session_id or None
+        if self._run_service.status(run_id, owner_filter) is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -4609,7 +4599,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         approval_session_key = self._run_service.approval_session_for(
-            run_id, expected_session_id
+            run_id, owner_filter
         )
         if not approval_session_key:
             return web.json_response(
@@ -4647,7 +4637,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         published = self._run_service.publish_approval_response(
             run_id,
-            expected_session_id=expected_session_id,
+            expected_session_id=owner_filter,
             choice=choice,
             resolved=resolved,
         )
@@ -4671,28 +4661,17 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        if not request.can_read_body:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-        if not isinstance(body, dict):
-            return web.json_response(
-                _openai_error("JSON body must be an object"),
-                status=400,
-            )
-        expected_session_id = str(body.get("session_id") or "").strip()
-        if not expected_session_id:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
+        owner_filter: Optional[str] = None
+        if request.can_read_body:
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                expected_session_id = str(body.get("session_id") or "").strip()
+                owner_filter = expected_session_id or None
 
-        result = self._run_service.stop(run_id, expected_session_id)
+        result = self._run_service.stop(run_id, owner_filter)
         if result is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),

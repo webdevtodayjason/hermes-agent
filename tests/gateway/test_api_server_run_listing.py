@@ -216,7 +216,7 @@ async def test_status_and_stop_enforce_the_expected_conversation_atomically():
         missing_status_payload = await missing_status.json()
         missing_stop_payload = await missing_stop.json()
         agent.interrupt.assert_not_called()
-        invalid_stop = await client.post(
+        unscoped_stop = await client.post(
             "/v1/runs/run_owned/stop",
             json=[],
         )
@@ -231,6 +231,6 @@ async def test_status_and_stop_enforce_the_expected_conversation_atomically():
     assert missing_stop.status == 404
     assert wrong_status_payload["error"]["code"] == missing_status_payload["error"]["code"]
     assert wrong_stop_payload["error"]["code"] == missing_stop_payload["error"]["code"]
-    assert invalid_stop.status == 400
+    assert unscoped_stop.status == 200
     assert right_stop.status == 200
     agent.interrupt.assert_called_once()
