@@ -222,6 +222,10 @@ _LONG_HANDLERS = frozenset(
         # the WS read loop and causing false "needs setup" (#50005 family).
         "setup.runtime_check",
         "setup.status",
+        "work.recover",
+        "work.start",
+        "work.status",
+        "work.stop",
         "session.branch",
         "session.compress",
         "session.list",
@@ -1222,6 +1226,114 @@ def method(name: str):
         return fn
 
     return dec
+
+
+def _work_runs_for_active_profile():
+    from tui_gateway.work_runs import get_work_runs
+
+    return get_work_runs(Path(get_hermes_home()).resolve())
+
+
+def _work_session_id(params: dict) -> str | None:
+    value = params.get("session_id")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _work_run_id(params: dict) -> str | None:
+    from tui_gateway.work_runs import is_valid_run_id
+
+    value = params.get("run_id")
+    if not is_valid_run_id(value):
+        return None
+    return value
+
+
+def _work_history(params: dict) -> list[dict] | None:
+    history = params.get("history", [])
+    if not isinstance(history, list):
+        return None
+    valid_roles = {"user", "assistant", "system", "tool"}
+    for message in history:
+        if not isinstance(message, dict):
+            return None
+        role = message.get("role")
+        content = message.get("content")
+        if role not in valid_roles or not isinstance(content, str):
+            return None
+    return history
+
+
+def _work_result(rid, callback):
+    from tui_gateway.work_runs import WorkRunNotFound
+
+    try:
+        return _ok(rid, callback())
+    except WorkRunNotFound:
+        return _err(rid, -32004, "run not found")
+
+
+@method("work.start")
+@_profile_scoped
+def _work_start(rid, params: dict) -> dict:
+    session_id = _work_session_id(params)
+    user_input = params.get("input")
+    history = _work_history(params)
+    if (
+        session_id is None
+        or not isinstance(user_input, str)
+        or not user_input.strip()
+        or history is None
+    ):
+        return _err(rid, -32602, "invalid work.start params")
+    result = _work_runs_for_active_profile().start(
+        session_id=session_id,
+        user_input=user_input,
+        history=history,
+    )
+    return _ok(rid, result)
+
+
+@method("work.recover")
+@_profile_scoped
+def _work_recover(rid, params: dict) -> dict:
+    session_id = _work_session_id(params)
+    if session_id is None:
+        return _err(rid, -32602, "invalid work.recover params")
+    return _ok(rid, _work_runs_for_active_profile().recover(session_id=session_id))
+
+
+@method("work.status")
+@_profile_scoped
+def _work_status(rid, params: dict) -> dict:
+    session_id = _work_session_id(params)
+    run_id = _work_run_id(params)
+    if session_id is None or run_id is None:
+        return _err(rid, -32602, "invalid work.status params")
+    return _work_result(
+        rid,
+        lambda: _work_runs_for_active_profile().status(
+            session_id=session_id,
+            run_id=run_id,
+        ),
+    )
+
+
+@method("work.stop")
+@_profile_scoped
+def _work_stop(rid, params: dict) -> dict:
+    session_id = _work_session_id(params)
+    run_id = _work_run_id(params)
+    if session_id is None or run_id is None:
+        return _err(rid, -32602, "invalid work.stop params")
+    return _work_result(
+        rid,
+        lambda: _work_runs_for_active_profile().stop(
+            session_id=session_id,
+            run_id=run_id,
+        ),
+    )
 
 
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
