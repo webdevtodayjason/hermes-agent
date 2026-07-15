@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,6 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
-    _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
 )
@@ -30,24 +30,6 @@ from tools import approval as approval_mod
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("smart_denied", "allow_permanent", "expected"),
-    [
-        (False, True, ["once", "session", "always", "deny"]),
-        (False, False, ["once", "session", "deny"]),
-        (True, True, ["once", "deny"]),
-        (True, False, ["once", "deny"]),
-    ],
-)
-def test_approval_event_choices_follow_backend_capabilities(
-    smart_denied, allow_permanent, expected
-):
-    assert _approval_event_choices(
-        smart_denied=smart_denied,
-        allow_permanent=allow_permanent,
-    ) == expected
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -138,7 +120,10 @@ class TestStartRun:
                 assert data["status"] == "started"
                 assert data["run_id"].startswith("run_")
 
-                status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
+                status_resp = await cli.get(
+                    f"/v1/runs/{data['run_id']}",
+                    params={"session_id": data["run_id"]},
+                )
                 assert status_resp.status == 200
                 status = await status_resp.json()
                 assert status["run_id"] == data["run_id"]
@@ -266,7 +251,10 @@ class TestRunStatus:
                 run_id = data["run_id"]
 
                 for _ in range(20):
-                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status_resp = await cli.get(
+                        f"/v1/runs/{run_id}",
+                        params={"session_id": "space-session"},
+                    )
                     status = await status_resp.json()
                     if status["status"] == "completed":
                         break
@@ -280,8 +268,40 @@ class TestRunStatus:
     async def test_status_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.get("/v1/runs/run_nonexistent")
+            resp = await cli.get(
+                "/v1/runs/run_nonexistent",
+                params={"session_id": "conversation-a"},
+            )
         assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_status_hides_wrong_session_like_missing(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_private_status"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            wrong = await cli.get(
+                f"/v1/runs/{run_id}",
+                params={"session_id": "conversation-b"},
+            )
+            missing = await cli.get(
+                "/v1/runs/run_missing",
+                params={"session_id": "conversation-b"},
+            )
+            payloads = [await response.json() for response in (wrong, missing)]
+
+        assert [response.status for response in (wrong, missing)] == [404] * 2
+        assert [payload["error"]["code"] for payload in payloads] == [
+            "run_not_found"
+        ] * 2
+        assert [set(payload["error"]) for payload in payloads] == [
+            set(payloads[0]["error"])
+        ] * 2
 
     @pytest.mark.asyncio
     async def test_status_requires_auth(self, auth_adapter):
@@ -316,16 +336,86 @@ class TestRunEvents:
                 data = await resp.json()
                 run_id = data["run_id"]
 
+                subscribed_queue = adapter._run_streams[run_id]
+
                 # Subscribe to events
-                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
-                assert events_resp.status == 200
-                body = await events_resp.text()
+                with patch.object(
+                    adapter._run_service,
+                    "unsubscribe",
+                    wraps=adapter._run_service.unsubscribe,
+                ) as unsubscribe:
+                    events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                    assert events_resp.status == 200
+                    body = await events_resp.text()
 
-                # Should contain run.completed
-                assert "run.completed" in body
-                assert "Hello!" in body
+                    # Should contain run.completed
+                    assert "run.completed" in body
+                    assert "Hello!" in body
+                    unsubscribe.assert_called_once_with(run_id, subscribed_queue)
 
+    @pytest.mark.asyncio
+    async def test_prepare_failure_unsubscribes_stream(self, adapter):
+        run_id = "run_prepare_failure"
+        queue = asyncio.Queue()
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
+        adapter._run_streams[run_id] = queue
 
+        class Request:
+            match_info = {"run_id": run_id}
+            query = {"session_id": "conversation-a"}
+            headers = {}
+
+        async def fail_prepare(_response, _request):
+            raise ConnectionResetError("client disconnected during SSE handshake")
+
+        with patch.object(web.StreamResponse, "prepare", fail_prepare):
+            with pytest.raises(ConnectionResetError):
+                await adapter._handle_run_events(Request())
+
+        assert adapter._run_service.stream_subscriber_queues.get(run_id) in (
+            None,
+            set(),
+        )
+        assert run_id not in adapter._run_service.stream_subscribers
+
+    @pytest.mark.asyncio
+    async def test_stop_during_approval_body_read_fails_closed(self, adapter):
+        run_id = "run_stop_during_body"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "session_id": "conversation-a",
+            "last_event": "approval.request",
+        }
+        adapter._run_approval_sessions[run_id] = "session-123"
+        adapter._active_run_agents[run_id] = MagicMock()
+
+        stop_results = []
+
+        class PausingRequest:
+            match_info = {"run_id": run_id}
+            query = {"session_id": "conversation-a"}
+            headers = {}
+
+            async def json(self):
+                stop_results.append(
+                    adapter._run_service.stop(run_id, "conversation-a")
+                )
+                return {"choice": "once"}
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            response = await adapter._handle_run_approval(PausingRequest())
+
+        assert stop_results == [{"run_id": run_id, "status": "stopping"}]
+        assert response.status == 409
+        payload = json.loads(response.text)
+        assert payload["error"]["code"] == "approval_not_active"
+        resolve.assert_not_called()
+        assert adapter._run_service.status(run_id)["status"] == "stopping"
 
     @pytest.mark.asyncio
     async def test_approval_response_without_pending_returns_409(self, adapter):
@@ -345,6 +435,7 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
+                    params={"session_id": run_id},
                     json={"choice": "once"},
                 )
                 assert approval_resp.status == 409
@@ -359,11 +450,17 @@ class TestRunEvents:
         """Quoted false must not fan out approval resolution across the queue."""
         app = _create_runs_app(adapter)
         run_id = "run_bool_parse"
-        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
         adapter._run_approval_sessions[run_id] = "session-123"
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve, patch.object(
+                adapter._run_service, "publish_approval_response"
+            ) as mock_publish:
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
                     json={"choice": "once", "all": "false"},
@@ -374,6 +471,12 @@ class TestRunEvents:
             "session-123",
             "once",
             resolve_all=False,
+        )
+        mock_publish.assert_called_once_with(
+            run_id,
+            expected_session_id=None,
+            choice="once",
+            resolved=1,
         )
 
     @pytest.mark.asyncio
@@ -423,6 +526,7 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
+                    params={"session_id": "shared-project"},
                     json={"choice": "always", "resolve_all": True},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
@@ -453,6 +557,106 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/runs/run_nonexistent/events")
         assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_events_hide_wrong_session_like_missing_without_queue_access(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        run_id = "run_private_events"
+        queue = asyncio.Queue()
+        queue.put_nowait({"event": "private"})
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
+        adapter._run_streams[run_id] = queue
+
+        async with TestClient(TestServer(app)) as cli:
+            wrong = await cli.get(
+                f"/v1/runs/{run_id}/events",
+                params={"session_id": "conversation-b"},
+            )
+            missing = await cli.get(
+                "/v1/runs/run_missing/events",
+                params={"session_id": "conversation-b"},
+            )
+            payloads = [await response.json() for response in (wrong, missing)]
+
+        assert [response.status for response in (wrong, missing)] == [404] * 2
+        assert [payload["error"]["code"] for payload in payloads] == [
+            "run_not_found"
+        ] * 2
+        assert queue.qsize() == 1
+        assert adapter._run_stream_subscribers == set()
+
+    @pytest.mark.asyncio
+    async def test_events_owner_at_subscriber_capacity_gets_sanitized_429(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_at_subscriber_capacity"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
+        adapter._run_streams[run_id] = asyncio.Queue(maxsize=2)
+        adapter._run_service._max_subscribers = 1
+        existing = adapter._run_service.subscribe(run_id, "conversation-a")
+        assert existing is not None
+
+        async with TestClient(TestServer(app)) as cli:
+            wrong = await cli.get(
+                f"/v1/runs/{run_id}/events",
+                params={"session_id": "conversation-b"},
+            )
+            owner = await cli.get(
+                f"/v1/runs/{run_id}/events",
+                params={"session_id": "conversation-a"},
+            )
+            owner_payload = await owner.json()
+
+        assert wrong.status == 404
+        assert owner.status == 429
+        assert owner_payload["error"]["code"] == "run_subscriber_limit"
+        assert "conversation-a" not in str(owner_payload)
+        assert len(adapter._run_service.stream_subscriber_queues[run_id]) == 1
+
+    @pytest.mark.asyncio
+    async def test_approval_hides_wrong_session_like_missing_without_mutation(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        run_id = "run_private_approval"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "session_id": "conversation-a",
+            "last_event": "approval.request",
+        }
+        adapter._run_approval_sessions[run_id] = "approval-a"
+        before = adapter._run_service.status(run_id)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval") as resolve:
+                wrong = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    params={"session_id": "conversation-b"},
+                    json={"choice": "once"},
+                )
+                missing = await cli.post(
+                    "/v1/runs/run_missing/approval",
+                    params={"session_id": "conversation-b"},
+                    json={"choice": "once"},
+                )
+                payloads = [await response.json() for response in (wrong, missing)]
+
+        assert [response.status for response in (wrong, missing)] == [404] * 2
+        assert [payload["error"]["code"] for payload in payloads] == [
+            "run_not_found"
+        ] * 2
+        resolve.assert_not_called()
+        assert adapter._run_service.status(run_id) == before
 
     @pytest.mark.asyncio
     async def test_events_requires_auth(self, auth_adapter):
@@ -529,13 +733,16 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
+                    params={"session_id": run_id},
                     json={"choice": "once"},
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()
                 assert pending.result == "once"
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 200
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
 
@@ -626,7 +833,9 @@ class TestStopRun:
                 run_id = (await resp.json())["run_id"]
                 await task_started.wait()
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 200
                 allow_task.set()
 
@@ -666,9 +875,13 @@ class TestStopRun:
                 run_id = (await resp.json())["run_id"]
                 assert started.wait(timeout=3)
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 200
-                repeated_stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                repeated_stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert repeated_stop_resp.status == 200
                 assert (await repeated_stop_resp.json()) == {
                     "run_id": run_id,
@@ -713,7 +926,7 @@ class TestStopRun:
                 # Verify agent ref is stored
                 assert run_id in adapter._active_run_agents
 
-                # Stop the run
+                # Stop the run using main-compatible bearer run_id semantics.
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 stop_data = await stop_resp.json()
@@ -723,7 +936,9 @@ class TestStopRun:
                 # Agent interrupt should have been called
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
 
-                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status_resp = await cli.get(
+                    f"/v1/runs/{run_id}", params={"session_id": run_id}
+                )
                 assert status_resp.status == 200
                 status_data = await status_resp.json()
                 assert status_data["status"] in {"stopping", "cancelled"}
@@ -737,8 +952,51 @@ class TestStopRun:
     async def test_stop_nonexistent_run_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/runs/run_nonexistent/stop")
+            resp = await cli.post(
+                "/v1/runs/run_nonexistent/stop",
+                json={"session_id": "conversation-a"},
+            )
         assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_stop_hides_wrong_ownership_like_missing_without_mutation(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_private_stop"
+        agent = MagicMock()
+        task = MagicMock()
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "running",
+            "session_id": "conversation-a",
+        }
+        adapter._active_run_agents[run_id] = agent
+        adapter._active_run_tasks[run_id] = task
+        before = adapter._run_service.status(run_id)
+
+        async with TestClient(TestServer(app)) as cli:
+            wrong = await cli.post(
+                f"/v1/runs/{run_id}/stop",
+                json={"session_id": "conversation-b"},
+            )
+            missing = await cli.post(
+                "/v1/runs/run_missing/stop",
+                json={"session_id": "conversation-b"},
+            )
+            responses = (wrong, missing)
+            payloads = [await response.json() for response in responses]
+
+        assert [response.status for response in responses] == [404] * len(responses)
+        assert [payload["error"]["code"] for payload in payloads] == [
+            "run_not_found"
+        ] * len(payloads)
+        assert [set(payload["error"]) for payload in payloads] == [
+            set(payloads[0]["error"])
+        ] * len(payloads)
+        agent.interrupt.assert_not_called()
+        assert adapter._run_service.status(run_id) == before
+        assert run_id not in adapter._stopping_run_ids
+        assert adapter._active_run_agents[run_id] is agent
+        assert adapter._active_run_tasks[run_id] is task
 
     @pytest.mark.asyncio
     async def test_stop_requires_auth(self, auth_adapter):
@@ -772,7 +1030,9 @@ class TestStopRun:
                 assert run_id not in adapter._active_run_agents
 
                 # Stop should return 404
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 404
 
     @pytest.mark.asyncio
@@ -802,7 +1062,9 @@ class TestStopRun:
                 agent_ready.wait(timeout=3.0)
                 await asyncio.sleep(0.1)
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 200
                 stop_data = await stop_resp.json()
                 assert stop_data["status"] == "stopping"
@@ -827,13 +1089,18 @@ class TestStopRun:
 
                 # Subscribe to events in background
                 events_task = asyncio.ensure_future(
-                    cli.get(f"/v1/runs/{run_id}/events")
+                    cli.get(
+                        f"/v1/runs/{run_id}/events",
+                        params={"session_id": run_id},
+                    )
                 )
 
                 await asyncio.sleep(0.1)
 
                 # Stop the run
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_resp = await cli.post(
+                    f"/v1/runs/{run_id}/stop", json={"session_id": run_id}
+                )
                 assert stop_resp.status == 200
 
                 # Events stream should close

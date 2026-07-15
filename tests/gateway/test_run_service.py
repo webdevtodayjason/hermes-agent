@@ -339,3 +339,93 @@ def test_claim_defers_control_cleanup_until_release():
     registry.release_stop_target("run_owned")
     assert registry.agent_for("run_owned") is None
     assert registry.task_for("run_owned") is None
+
+
+def test_list_for_session_filters_orders_and_enforces_owner_limit():
+    registry = RunRegistry()
+    for index in range(105):
+        registry.set_status(
+            f"run_{index:03d}",
+            "running",
+            created_at=float(index),
+            session_id="conversation-a",
+        )
+    registry.set_status(
+        "run_other",
+        "running",
+        created_at=1000.0,
+        session_id="conversation-ab",
+    )
+
+    runs = registry.list_for_session("conversation-a", limit=1000)
+
+    assert len(runs) == 100
+    assert [run["run_id"] for run in runs[:3]] == [
+        "run_104",
+        "run_103",
+        "run_102",
+    ]
+    assert runs[-1]["run_id"] == "run_005"
+    assert all(run["session_id"] == "conversation-a" for run in runs)
+
+
+def test_get_hides_missing_run_and_conversation_mismatch_the_same_way():
+    registry = RunRegistry()
+    registry.set_status("run_owned", "running", session_id="conversation-a")
+
+    owned = registry.get("run_owned", expected_session_id="conversation-a")
+    assert owned is not None
+    assert owned["run_id"] == "run_owned"
+    assert registry.get("run_owned", expected_session_id="conversation-b") is None
+    assert registry.get("run_missing", expected_session_id="conversation-b") is None
+
+
+def test_claim_stop_target_checks_owner_before_mutating_control_state():
+    registry = RunRegistry()
+    agent = object()
+    task = object()
+    registry.set_status("run_owned", "running", session_id="conversation-a")
+    registry.register_agent("run_owned", agent)
+    registry.register_task("run_owned", task)
+
+    assert registry.claim_stop_target("run_owned", "conversation-b") is None
+    assert registry.claim_stop_target("run_missing", "conversation-a") is None
+    assert not registry.is_stopping("run_owned")
+
+    claimed = registry.claim_stop_target("run_owned", "conversation-a")
+    assert claimed is not None
+    assert claimed.agent is agent
+    assert claimed.task is task
+    assert registry.is_stopping("run_owned")
+    registry.release_stop_target("run_owned")
+
+
+def test_active_update_fence_rejects_owner_mismatch_stop_and_terminal_state():
+    registry = RunRegistry(clock=lambda: 42.0)
+    registry.set_status("run_owned", "running", session_id="conversation-a")
+
+    assert registry.set_status_if_active(
+        "run_owned",
+        "waiting_for_approval",
+        expected_session_id="conversation-b",
+        last_event="approval.request",
+    ) is None
+    before_stop = registry.get("run_owned")
+    registry.register_agent("run_owned", object())
+    target = registry.claim_stop_target("run_owned", "conversation-a")
+    assert target is not None
+    assert registry.set_status_if_active(
+        "run_owned", "waiting_for_approval", last_event="approval.request"
+    ) is None
+    stopping = registry.get("run_owned")
+    assert stopping is not None and stopping["status"] == "stopping"
+    registry.release_stop_target("run_owned")
+    registry.remove_control("run_owned")
+
+    registry.set_status("run_owned", "cancelled", last_event="run.cancelled")
+    assert registry.set_status_if_active(
+        "run_owned", "running", last_event="approval.responded"
+    ) is None
+    cancelled = registry.get("run_owned")
+    assert cancelled is not None and cancelled["status"] == "cancelled"
+    assert before_stop is not None and before_stop["status"] == "running"

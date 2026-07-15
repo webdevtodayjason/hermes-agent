@@ -70,14 +70,20 @@ class TestRedactApprovalCommand:
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
     1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
-    2. the SSE/API path (_approval_notify in gateway/platforms/api_server.py),
+    2. the transport-neutral run-service path (approval_notify),
     each of which must route the command through _redact_approval_command and
     REASSIGN the redacted value before any send/enqueue (so the raw command
     cannot reach a client). Uses AST (not char-offset string slicing) so a
     benign refactor doesn't cause a false failure, and so a discarded-result
     call (`_redact(cmd); send(cmd)`) does NOT pass."""
 
-    def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str):
+    def _assert_redacts_then_uses(
+        self,
+        module,
+        func_name: str,
+        sink_substr: str,
+        redactor_name: str = "_redact_approval_command",
+    ):
         """Parse `module`'s full AST, locate the (possibly nested) function
         `func_name`, and assert it contains an assignment
         `<x> = _redact_approval_command(...)` whose result is then used by a
@@ -97,24 +103,49 @@ class TestApprovalCommandWiring:
         assert target_fn is not None, f"function {func_name} not found in {module.__name__}"
 
         redact_line = None
+        redacted_name = None
         for node in ast.walk(target_fn):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 fn = node.value.func
-                if isinstance(fn, ast.Name) and fn.id == "_redact_approval_command":
+                called_name = (
+                    fn.id if isinstance(fn, ast.Name)
+                    else fn.attr if isinstance(fn, ast.Attribute)
+                    else None
+                )
+                if called_name != redactor_name or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    redacted_name = target.id
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "command"
+                ):
+                    redacted_name = target.value.id
+                if redacted_name is not None:
                     redact_line = node.lineno
-        assert redact_line is not None, (
-            f"{func_name} must assign the result of _redact_approval_command(...) "
-            "(a discarded-result call would still leak the raw command)"
+                    break
+        assert redact_line is not None and redacted_name is not None, (
+            f"{func_name} must assign the result of {redactor_name}(...) to the "
+            "published command value"
         )
 
         sink_line = None
         for node in ast.walk(target_fn):
+            if not isinstance(node, ast.Call) or node.lineno <= redact_line:
+                continue
             seg = ast.get_source_segment(source, node)
-            if seg and sink_substr in seg and getattr(node, "lineno", 0) > redact_line:
+            names = {
+                child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+            }
+            if seg and sink_substr in seg and redacted_name in names:
                 sink_line = node.lineno
                 break
         assert sink_line is not None, (
-            f"`{sink_substr}` sink not found after the redaction in {func_name}"
+            f"`{sink_substr}` must publish the value assigned by {redactor_name} "
+            f"in {func_name}"
         )
 
     def test_chat_platform_path_redacts_before_send(self):
@@ -123,9 +154,14 @@ class TestApprovalCommandWiring:
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
     def test_sse_api_path_redacts_before_enqueue(self):
-        from gateway.platforms import api_server
+        from gateway import run_service
 
-        self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
+        self._assert_redacts_then_uses(
+            run_service,
+            "approval_notify",
+            "_publish_nonterminal_event",
+            "redact_approval_command",
+        )
 
     def test_chat_platform_threads_approval_capabilities_to_adapter(self):
         """The gateway must not drop the backend's one-operation UI contract."""
