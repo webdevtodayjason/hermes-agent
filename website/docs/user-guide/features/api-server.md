@@ -272,6 +272,17 @@ Poll the current run state. This is useful for dashboards that need status witho
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
 
+### TUI/Desktop JSON-RPC adapter
+
+The TUI gateway exposes the same lifecycle to local Desktop/TUI clients as four synchronous JSON-RPC methods:
+
+- `work.start` — `{session_id, input, history?}`
+- `work.recover` — `{session_id}`
+- `work.status` — `{session_id, run_id}`
+- `work.stop` — `{session_id, run_id}`
+
+These methods are a transport adapter over the canonical Runs service. They do **not** define a separate Desktop task API or own another task/run collection. A stable, non-empty `session_id` is required for recovery and ownership checks; status and stop deliberately make a wrong-owner run indistinguishable from a nonexistent run. HTTP and JSON-RPC clients attached to the same process/profile composition observe the same public run fields and terminal lifecycle.
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
