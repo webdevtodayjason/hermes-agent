@@ -331,6 +331,50 @@ class RunRegistry:
                 now=now,
             )
 
+    def update_if_nonterminal(
+        self,
+        run_id: str,
+        *,
+        status: Optional[str] = None,
+        expected_session_id: Optional[str] = None,
+        **fields: Any,
+    ) -> bool:
+        """Atomically update an active run without reopening terminalization."""
+        if type(run_id) is not str:
+            raise TypeError("run id must be a string")
+        if (
+            expected_session_id is not None
+            and type(expected_session_id) is not str
+        ):
+            raise TypeError("expected session id must be a string")
+        if status is not None:
+            _validate_run_status(status)
+            if status not in ACTIVE_RUN_STATUSES:
+                raise ValueError("conditional run status must remain nonterminal")
+        now = self.finite_timestamp(self._clock())
+        for field in ("created_at", "updated_at"):
+            if field in fields:
+                fields[field] = self.finite_timestamp(fields[field])
+        incoming = _snapshot_status_value(fields)
+        with self._lock:
+            current = self._statuses.get(run_id)
+            if (
+                current is None
+                or current.get("status") not in ACTIVE_RUN_STATUSES
+                or (
+                    expected_session_id is not None
+                    and current.get("session_id") != expected_session_id
+                )
+            ):
+                return False
+            self._set_status_locked(
+                run_id,
+                status or current["status"],
+                incoming,
+                now=now,
+            )
+            return True
+
     def get(
         self, run_id: str, expected_session_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
@@ -574,14 +618,29 @@ class RunService:
     ) -> None:
         if self.streams.get(run_id) is not queue:
             return
+        event_name = event.get("event") if event is not None else None
+        replay = self._terminal_replays.get(run_id)
         if event is None:
-            replay = self._terminal_replays.get(run_id)
-            if replay is not None and replay[-1] is not None:
-                self._terminal_replays[run_id] = replay + (None,)
-        elif event.get("event") in TERMINAL_RUN_EVENTS:
+            if replay is None or replay[-1] is None:
+                return
+            self._terminal_replays[run_id] = replay + (None,)
+        elif event_name in TERMINAL_RUN_EVENTS:
+            terminal_status = self.registry.status_value(run_id, "status")
+            if (
+                replay is not None
+                or terminal_status not in TERMINAL_RUN_STATUSES
+                or event_name != f"run.{terminal_status}"
+            ):
+                return
             self._terminal_replays[run_id] = (
                 _snapshot_status_value(event),
             )
+        elif (
+            replay is not None
+            or self.registry.status_value(run_id, "status")
+            not in ACTIVE_RUN_STATUSES
+        ):
+            return
         subscribers = self.stream_subscriber_queues.get(run_id)
         if subscribers:
             for subscriber_queue in tuple(subscribers):
@@ -615,14 +674,12 @@ class RunService:
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
     ) -> Callable[..., None]:
         def push(event: Dict[str, Any]) -> None:
-            self.registry.set_status(
-                run_id,
-                self.registry.status_value(run_id, "status", "running"),
-                last_event=event.get("event"),
-            )
-            loop.call_soon_threadsafe(
-                self._put_event_if_active, run_id, queue, event
-            )
+            if self.registry.update_if_nonterminal(
+                run_id, last_event=event.get("event")
+            ):
+                loop.call_soon_threadsafe(
+                    self._put_event_if_active, run_id, queue, event
+                )
 
         def callback(
             event_type: str,
@@ -712,6 +769,11 @@ class RunService:
             if delta is None:
                 return
             try:
+                if (
+                    self.registry.status_value(run_id, "status")
+                    not in ACTIVE_RUN_STATUSES
+                ):
+                    return
                 loop.call_soon_threadsafe(
                     self._put_event_if_active,
                     run_id,
@@ -762,17 +824,18 @@ class RunService:
                                 "choices": self._approval_choices(event),
                             }
                         )
-                        self.registry.set_status(
+                        accepted = self.registry.update_if_nonterminal(
                             run_id,
-                            "waiting_for_approval",
+                            status="waiting_for_approval",
                             last_event="approval.request",
                         )
-                        loop.call_soon_threadsafe(
-                            self._put_event_if_active,
-                            run_id,
-                            queue,
-                            event,
-                        )
+                        if accepted:
+                            loop.call_soon_threadsafe(
+                                self._put_event_if_active,
+                                run_id,
+                                queue,
+                                event,
+                            )
                     except Exception:
                         logger.debug(
                             "run %s approval telemetry callback failed",
@@ -843,7 +906,6 @@ class RunService:
                         "output": output,
                         "usage": usage,
                     }
-                    self._put_event_if_active(run_id, queue, event)
                     self.registry.set_status(
                         run_id,
                         "completed",
@@ -851,6 +913,7 @@ class RunService:
                         usage=usage,
                         last_event="run.completed",
                     )
+                    self._put_event_if_active(run_id, queue, event)
             except asyncio.CancelledError:
                 self._cancel(run_id, queue)
                 raise
@@ -890,6 +953,9 @@ class RunService:
         run_id: str,
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
     ) -> None:
+        self.registry.set_status(
+            run_id, "cancelled", last_event="run.cancelled"
+        )
         self._put_event_if_active(
             run_id,
             queue,
@@ -899,9 +965,6 @@ class RunService:
                 "timestamp": self._clock(),
             },
         )
-        self.registry.set_status(
-            run_id, "cancelled", last_event="run.cancelled"
-        )
 
     def _finish_failed(
         self,
@@ -909,6 +972,9 @@ class RunService:
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
         error: str,
     ) -> None:
+        self.registry.set_status(
+            run_id, "failed", error=error, last_event="run.failed"
+        )
         self._put_event_if_active(
             run_id,
             queue,
@@ -918,9 +984,6 @@ class RunService:
                 "timestamp": self._clock(),
                 "error": error,
             },
-        )
-        self.registry.set_status(
-            run_id, "failed", error=error, last_event="run.failed"
         )
 
     def stop(
@@ -949,29 +1012,23 @@ class RunService:
         resolved: int,
     ) -> bool:
         """Publish lifecycle state after the adapter resolves an approval."""
-        if (
-            expected_session_id is not None
-            and self.registry.get(run_id, expected_session_id) is None
+        event = {
+            "event": "approval.responded",
+            "run_id": run_id,
+            "timestamp": self._clock(),
+            "choice": choice,
+            "resolved": resolved,
+        }
+        if not self.registry.update_if_nonterminal(
+            run_id,
+            status="running",
+            expected_session_id=expected_session_id,
+            last_event="approval.responded",
         ):
             return False
-        self.registry.set_status(
-            run_id,
-            "running",
-            last_event="approval.responded",
-        )
         queue = self.streams.get(run_id)
         if queue is not None:
-            self._put_event_if_active(
-                run_id,
-                queue,
-                {
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": self._clock(),
-                    "choice": choice,
-                    "resolved": resolved,
-                },
-            )
+            self._put_event_if_active(run_id, queue, event)
         return True
 
     def subscribe(

@@ -331,6 +331,168 @@ async def test_bounded_backpressure_preserves_terminal_event_and_sentinel_for_al
     ]
 
 
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        ({"final_response": "finished"}, "completed"),
+        ({"failed": True, "error": "failed"}, "failed"),
+    ],
+)
+@pytest.mark.anyio
+async def test_delayed_callbacks_after_terminal_cannot_regress_or_displace_delivery(
+    result, expected_status
+):
+    hooks = FakeHooks(FakeAgent(result))
+    service = RunService(hooks, queue_maxsize=2)
+
+    run_id = _start(service)
+    terminal_status = await _wait_terminal(service, run_id)
+    await hooks.tracked[0]
+    queue = service.stream_for(run_id)
+    assert queue is not None
+    terminal_event = service._terminal_replays[run_id][0]
+    text_callback = hooks.created[-1]["stream_delta_callback"]
+    tool_callback = hooks.created[-1]["tool_progress_callback"]
+    approval_callback = hooks.registered[-1][1]
+
+    await asyncio.to_thread(text_callback, "late text")
+    await asyncio.to_thread(
+        tool_callback,
+        "tool.started",
+        tool_name="terminal",
+        preview="late tool",
+    )
+    asyncio.get_running_loop().call_soon(
+        approval_callback,
+        {"command": "late approval", "allow_permanent": True},
+    )
+    assert service.publish_approval_response(
+        run_id,
+        expected_session_id="conversation-a",
+        choice="once",
+        resolved=1,
+    ) is False
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert queue.qsize() == 2
+    assert queue.get_nowait() == terminal_event
+    assert queue.get_nowait() is None
+    assert service.status(run_id) == terminal_status
+    assert terminal_status["status"] == expected_status
+    assert terminal_status["last_event"] == f"run.{expected_status}"
+
+
+@pytest.mark.anyio
+async def test_delayed_callbacks_after_cancellation_cannot_regress_or_displace_delivery():
+    agent = FakeAgent()
+    agent.block = True
+    hooks = FakeHooks(agent)
+    service = RunService(hooks, queue_maxsize=2)
+
+    run_id = _start(service)
+    assert await asyncio.to_thread(agent.started.wait, 3)
+    text_callback = hooks.created[-1]["stream_delta_callback"]
+    tool_callback = hooks.created[-1]["tool_progress_callback"]
+    approval_callback = hooks.registered[-1][1]
+    assert service.stop(run_id, "conversation-a") == {
+        "run_id": run_id,
+        "status": "stopping",
+    }
+    terminal_status = await _wait_terminal(service, run_id)
+    await hooks.tracked[0]
+    queue = service.stream_for(run_id)
+    assert queue is not None
+    terminal_event = service._terminal_replays[run_id][0]
+
+    await asyncio.to_thread(text_callback, "late text")
+    await asyncio.to_thread(
+        tool_callback,
+        "tool.started",
+        tool_name="terminal",
+        preview="late tool",
+    )
+    approval_callback({"command": "late approval", "allow_permanent": True})
+    assert service.publish_approval_response(
+        run_id,
+        expected_session_id="conversation-a",
+        choice="once",
+        resolved=1,
+    ) is False
+    await asyncio.sleep(0)
+
+    assert queue.qsize() == 2
+    assert queue.get_nowait() == terminal_event
+    assert queue.get_nowait() is None
+    assert service.status(run_id) == terminal_status
+    assert terminal_status["status"] == "cancelled"
+    assert terminal_status["last_event"] == "run.cancelled"
+
+
+@pytest.mark.anyio
+async def test_text_producer_does_not_schedule_after_terminal(monkeypatch):
+    hooks = FakeHooks(FakeAgent({"final_response": "finished"}))
+    service = RunService(hooks, queue_maxsize=2)
+
+    run_id = _start(service)
+    await _wait_terminal(service, run_id)
+    await hooks.tracked[0]
+    text_callback = hooks.created[-1]["stream_delta_callback"]
+    scheduled = []
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+
+    def record_delivery(callback, *args):
+        if callback == service._put_event_if_active:
+            scheduled.append((callback, *args))
+        return original_call_soon_threadsafe(callback, *args)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", record_delivery)
+
+    text_callback("late text")
+    await asyncio.sleep(0)
+
+    assert scheduled == []
+
+
+@pytest.mark.anyio
+async def test_nonterminal_delivery_scheduled_before_terminal_drops_when_it_runs_late():
+    service = RunService(FakeHooks(), queue_maxsize=2, clock=lambda: 42.0)
+    run_id = "run_scheduled_late"
+    queue = asyncio.Queue(maxsize=2)
+    service.streams[run_id] = queue
+    service.registry.set_status(
+        run_id, "running", session_id="conversation-a"
+    )
+    late_event = {
+        "event": "message.delta",
+        "run_id": run_id,
+        "timestamp": 41.0,
+        "delta": "late",
+    }
+
+    asyncio.get_running_loop().call_soon(
+        service._put_event_if_active, run_id, queue, late_event
+    )
+    service.registry.set_status(
+        run_id, "completed", last_event="run.completed"
+    )
+    terminal_event = {
+        "event": "run.completed",
+        "run_id": run_id,
+        "timestamp": 42.0,
+        "output": "done",
+        "usage": {},
+    }
+    service._put_event_if_active(run_id, queue, terminal_event)
+    service._put_event_if_active(run_id, queue, None)
+    await asyncio.sleep(0)
+
+    assert queue.qsize() == 2
+    assert queue.get_nowait() == terminal_event
+    assert queue.get_nowait() is None
+
+
 @pytest.mark.anyio
 async def test_subscriber_limit_bounds_queue_count_after_ownership_check():
     agent = FakeAgent()
@@ -601,3 +763,39 @@ async def test_publish_approval_response_updates_status_and_enqueues_event():
         "choice": "session",
         "resolved": 2,
     }
+
+
+@pytest.mark.anyio
+async def test_publish_approval_response_rejects_terminal_without_mutation_or_event():
+    service = RunService(FakeHooks(), clock=lambda: 42.0)
+    run_id = "run_terminal_approval"
+    queue = asyncio.Queue(maxsize=2)
+    terminal_event = {
+        "event": "run.completed",
+        "run_id": run_id,
+        "timestamp": 41.0,
+        "output": "done",
+        "usage": {},
+    }
+    queue.put_nowait(terminal_event)
+    queue.put_nowait(None)
+    service.streams[run_id] = queue
+    service.registry.set_status(
+        run_id,
+        "completed",
+        session_id="conversation-a",
+        output="done",
+        last_event="run.completed",
+    )
+    before = service.status(run_id)
+
+    assert service.publish_approval_response(
+        run_id,
+        expected_session_id="conversation-a",
+        choice="once",
+        resolved=1,
+    ) is False
+    assert service.status(run_id) == before
+    assert queue.qsize() == 2
+    assert queue.get_nowait() == terminal_event
+    assert queue.get_nowait() is None

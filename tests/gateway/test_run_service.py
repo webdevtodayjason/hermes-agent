@@ -242,6 +242,84 @@ def test_unsupported_status_value_fails_before_lock_without_partial_update():
     assert registry.get("run_owned") == before
 
 
+def test_update_if_nonterminal_accepts_active_and_rejects_terminal_or_wrong_owner():
+    registry = RunRegistry(clock=lambda: 20.0)
+    registry.set_status(
+        "run_active",
+        "running",
+        session_id="conversation-a",
+        last_event="run.started",
+    )
+    registry.set_status(
+        "run_terminal",
+        "completed",
+        session_id="conversation-a",
+        last_event="run.completed",
+    )
+    registry.set_status(
+        "run_stopping",
+        "stopping",
+        session_id="conversation-a",
+        last_event="run.stopping",
+    )
+
+    assert registry.update_if_nonterminal(
+        "run_active", last_event="tool.started"
+    ) is True
+    assert registry.update_if_nonterminal(
+        "run_active",
+        status="waiting_for_approval",
+        expected_session_id="conversation-b",
+        last_event="approval.request",
+    ) is False
+    assert registry.update_if_nonterminal(
+        "run_terminal",
+        status="running",
+        expected_session_id="conversation-a",
+        last_event="approval.responded",
+    ) is False
+    assert registry.update_if_nonterminal(
+        "run_stopping",
+        status="waiting_for_approval",
+        expected_session_id="conversation-a",
+        last_event="approval.request",
+    ) is False
+    assert registry.update_if_nonterminal(
+        "run_missing", last_event="tool.started"
+    ) is False
+
+    assert registry.get("run_active")["status"] == "running"
+    assert registry.get("run_active")["last_event"] == "tool.started"
+    assert registry.get("run_terminal")["status"] == "completed"
+    assert registry.get("run_terminal")["last_event"] == "run.completed"
+    assert registry.get("run_stopping")["status"] == "stopping"
+    assert registry.get("run_stopping")["last_event"] == "run.stopping"
+
+
+def test_update_if_nonterminal_runs_clock_callback_without_registry_lock():
+    registry = RunRegistry()
+    registry.set_status("run_active", "running", session_id="conversation-a")
+    callback_finished = threading.Event()
+
+    def clock():
+        thread = threading.Thread(
+            target=lambda: (
+                registry.get("run_active"),
+                callback_finished.set(),
+            )
+        )
+        thread.start()
+        thread.join(timeout=1)
+        return 20.0
+
+    registry._clock = clock
+
+    assert registry.update_if_nonterminal(
+        "run_active", last_event="tool.started"
+    ) is True
+    assert callback_finished.is_set()
+
+
 def test_set_status_rejects_unknown_states_and_nonfinite_payload_values():
     registry = RunRegistry()
 
