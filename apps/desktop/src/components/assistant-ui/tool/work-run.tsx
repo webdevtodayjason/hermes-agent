@@ -20,6 +20,11 @@ import { Button } from '@/components/ui/button'
 
 const WorkRunClientContext = createContext<WorkhorseClient | null>(null)
 
+/** Consumer hook for the live client; null means transcript-replay mode. */
+export function useWorkRunClient(): WorkhorseClient | null {
+  return useContext(WorkRunClientContext)
+}
+
 export function WorkRunClientProvider({
   client,
   children

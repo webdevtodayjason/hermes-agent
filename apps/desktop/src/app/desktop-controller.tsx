@@ -85,6 +85,7 @@ import {
   PREVIEW_RAIL_PANE_WIDTH
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
+import { ChatWorkRunProvider } from './chat/work-run-provider'
 import { CommandPalette } from './command-palette'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
@@ -1109,6 +1110,7 @@ export function DesktopController() {
   )
 
   const chatView = (
+    <ChatWorkRunProvider profile={activeGatewayProfile} request={requestGateway}>
     <ChatView
       gateway={gatewayRef.current}
       maxVoiceRecordingSeconds={voiceMaxRecordingSeconds}
@@ -1140,6 +1142,7 @@ export function DesktopController() {
       onToggleSelectedPin={toggleSelectedPin}
       onTranscribeAudio={transcribeVoiceAudio}
     />
+    </ChatWorkRunProvider>
   )
 
   // Flipped layout mirrors the default: sessions sidebar → right, file
