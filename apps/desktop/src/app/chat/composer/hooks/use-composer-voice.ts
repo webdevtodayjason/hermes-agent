@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
+import { stopVoicePlayback } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
 import { $messages } from '@/store/session'
 import { $autoSpeakReplies, setAutoSpeakReplies } from '@/store/voice-prefs'
@@ -26,10 +27,8 @@ interface UseComposerVoiceArgs {
 
 /**
  * The composer's voice engine: push-to-talk dictation (transcript → draft),
- * the full-duplex Realtime voice conversation, and auto-speak of replies.
- * The serialized STT→submit→TTS conversation loop is retired: Voice
- * Conversation now runs on the Realtime transport and fails closed when it
- * is unavailable rather than silently degrading (COLLAB-LOG 05:12Z rule).
+ * Realtime STT/VAD for Spoke, and canonical assistant-reply narration. Every
+ * user final is handed to canonical Hermes; the provider never authors replies.
  */
 export function useComposerVoice({
   disabled,
@@ -93,6 +92,7 @@ export function useComposerVoice({
   const conversation = useRealtimeConversation({
     createClient: realtimeVoiceFactory,
     enabled: voiceConversationActive,
+    onBargeIn: stopVoicePlayback,
     onFatalError: onVoiceFatalError,
     onUserTranscript,
     sessionId
@@ -134,9 +134,12 @@ export function useComposerVoice({
   useAutoSpeakReplies({
     conversationActive: voiceConversationActive,
     failureLabel: t.assistant.thread.readAloudFailed,
+    isNarrationBlocked: conversation.isNarrationBlocked,
+    isUserSpeaking: conversation.isUserSpeaking,
     markSpoken: consumePendingResponse,
     pendingReply: pendingResponse,
-    sessionId
+    sessionId,
+    userSpeaking: conversation.userSpeaking
   })
 
   return {
