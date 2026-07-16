@@ -100,4 +100,69 @@ describe('WorkRunTool inline chip', () => {
     renderChip(client, undefined)
     expect(screen.getByTestId('work-run-status').textContent).toContain('starting')
   })
+
+  it('parses the backend JSON-string result shape', async () => {
+    const { client, sinks } = makeClient()
+    renderChip(
+      client,
+      JSON.stringify({
+        run_id: 'run_json',
+        status: 'running',
+        session_id: 'conversation-parent'
+      })
+    )
+
+    await waitFor(() => expect(screen.getByTestId('work-run-status').textContent).toContain('running'))
+    await waitFor(() => expect(sinks.has('run_json')).toBe(true))
+  })
+
+  it('settles an existing pending chip when the tool result arrives', async () => {
+    const { client, sinks } = makeClient()
+
+    const view = render(
+      <WorkRunClientProvider client={client}>
+        <WorkRunTool args={{ task: 'late result' }} result={undefined} />
+      </WorkRunClientProvider>
+    )
+
+    expect(screen.getByTestId('work-run-status').textContent).toContain('starting')
+
+    view.rerender(
+      <WorkRunClientProvider client={client}>
+        <WorkRunTool
+          args={{ task: 'late result' }}
+          result={{ run_id: 'run_late', status: 'running', session_id: 'conversation-parent' }}
+        />
+      </WorkRunClientProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('work-run-status').textContent).toContain('running'))
+    await waitFor(() => expect(sinks.has('run_late')).toBe(true))
+  })
+
+  it('uses the canonical owner session for watch, status, and Stop', async () => {
+    const { client, sinks } = makeClient()
+    renderChip(client, {
+      run_id: 'run_owned',
+      status: 'running',
+      session_id: 'conversation-parent'
+    })
+
+    await waitFor(() =>
+      expect(client.watch).toHaveBeenCalledWith('run_owned', expect.any(Function), 'conversation-parent')
+    )
+    screen.getByRole('button', { name: 'Stop' }).click()
+    await waitFor(() =>
+      expect(client.stop).toHaveBeenCalledWith('run_owned', 'conversation-parent')
+    )
+
+    await act(async () => sinks.get('run_owned')?.({ event: 'status.update' }))
+    expect(client.status).not.toHaveBeenCalled()
+    expect(sinks.has('run_owned')).toBe(true)
+
+    await act(async () => sinks.get('run_owned')?.({ event: 'run.completed' }))
+    await waitFor(() =>
+      expect(client.status).toHaveBeenCalledWith('run_owned', 'conversation-parent')
+    )
+  })
 })

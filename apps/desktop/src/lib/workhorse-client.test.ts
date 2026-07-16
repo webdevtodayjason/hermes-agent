@@ -95,6 +95,36 @@ describe('createWorkhorseClient', () => {
     })
   })
 
+  it('uses the canonical inline owner for status, Stop, and watch polling', async () => {
+    vi.useFakeTimers()
+
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ run_id: 'run_owned', status: 'running' })
+      .mockResolvedValueOnce({ run_id: 'run_owned', status: 'stopping' })
+      .mockResolvedValueOnce({ run_id: 'run_owned', status: 'completed' })
+
+    const client = createWorkhorseClient({ profile: 'default', request })
+
+    await client.status('run_owned', 'conversation-parent')
+    await client.stop('run_owned', 'conversation-parent')
+    client.watch('run_owned', vi.fn(), 'conversation-parent')
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(request).toHaveBeenNthCalledWith(1, 'work.status', {
+      run_id: 'run_owned',
+      session_id: 'conversation-parent'
+    })
+    expect(request).toHaveBeenNthCalledWith(2, 'work.stop', {
+      run_id: 'run_owned',
+      session_id: 'conversation-parent'
+    })
+    expect(request).toHaveBeenNthCalledWith(3, 'work.status', {
+      run_id: 'run_owned',
+      session_id: 'conversation-parent'
+    })
+  })
+
   it('polls status and synthesizes exactly one terminal event', async () => {
     vi.useFakeTimers()
 

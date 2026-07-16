@@ -37,11 +37,11 @@ export interface WorkhorseEvent {
 export interface WorkhorseClient {
   startWork(input: string): Promise<WorkhorseRun>
   recover(): Promise<WorkhorseRun[]>
-  status(runId: string): Promise<WorkhorseRun>
-  stop(runId: string): Promise<WorkhorseRun>
+  status(runId: string, sessionId?: string): Promise<WorkhorseRun>
+  stop(runId: string, sessionId?: string): Promise<WorkhorseRun>
   /** Live event feed for one run; returns unsubscribe. Implementations may
    *  poll status as a degraded fallback but must still emit terminal events. */
-  watch(runId: string, onEvent: (event: WorkhorseEvent) => void): () => void
+  watch(runId: string, onEvent: (event: WorkhorseEvent) => void, sessionId?: string): () => void
 }
 
 /** Model-callable delegation tool whose tool-call/result part the inline

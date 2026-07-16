@@ -1,4 +1,4 @@
-import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   TERMINAL_RUN_STATUSES,
@@ -53,16 +53,48 @@ const STATUS_TONE: Record<WorkhorseRunStatus | 'starting', string> = {
   cancelled: 'bg-muted text-muted-foreground'
 }
 
-function parseRun(result: unknown): WorkhorseRun | null {
-  if (!result || typeof result !== 'object') {return null}
-  const record = result as { run_id?: unknown; runId?: unknown; status?: unknown; output?: unknown; error?: unknown }
+interface OwnedWorkhorseRun extends WorkhorseRun {
+  sessionId?: string
+}
+
+function parseRun(result: unknown): OwnedWorkhorseRun | null {
+  let candidate = result
+
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate)
+    } catch {
+      return null
+    }
+  }
+
+  if (!candidate || typeof candidate !== 'object') {return null}
+
+  const record = candidate as {
+    run_id?: unknown
+    runId?: unknown
+    status?: unknown
+    session_id?: unknown
+    sessionId?: unknown
+    output?: unknown
+    error?: unknown
+  }
+
   const runId = typeof record.run_id === 'string' ? record.run_id : typeof record.runId === 'string' ? record.runId : null
+
+  const sessionId =
+    typeof record.session_id === 'string'
+      ? record.session_id
+      : typeof record.sessionId === 'string'
+        ? record.sessionId
+        : undefined
 
   if (!runId || typeof record.status !== 'string') {return null}
 
   return {
     runId,
     status: record.status as WorkhorseRunStatus,
+    ...(sessionId && { sessionId }),
     ...(typeof record.output === 'string' && { output: record.output }),
     ...(typeof record.error === 'string' && { error: record.error })
   }
@@ -86,14 +118,20 @@ function isTerminal(status: WorkhorseRunStatus): boolean {
 
 export function WorkRunTool({ args, result }: WorkRunToolProps) {
   const client = useContext(WorkRunClientContext)
-  const recorded = parseRun(result)
-  const [run, setRun] = useState<WorkhorseRun | null>(recorded)
+  const recorded = useMemo(() => parseRun(result), [result])
+  const [run, setRun] = useState<OwnedWorkhorseRun | null>(recorded)
   const [lastEvent, setLastEvent] = useState('')
   const unsubscribeRef = useRef<(() => void) | null>(null)
 
-  // The recorded tool result is authoritative on (re)mount; live updates
-  // layer on top of it.
+  // A tool part normally renders once while pending and receives its result on
+  // the same mounted component. Keep the live state aligned with that durable
+  // transcript transition instead of relying on a remount.
+  useEffect(() => {
+    if (recorded) {setRun(recorded)}
+  }, [recorded])
+
   const runId = recorded?.runId ?? run?.runId ?? null
+  const ownerSessionId = recorded?.sessionId ?? run?.sessionId
   const live = client !== null && runId !== null && run !== null && !isTerminal(run.status)
 
   useEffect(() => {
@@ -101,19 +139,34 @@ export function WorkRunTool({ args, result }: WorkRunToolProps) {
 
     if (unsubscribeRef.current) {return}
 
-    const unsubscribe = client.watch(runId, (event: WorkhorseEvent) => {
+    const onEvent = (event: WorkhorseEvent) => {
       const name = event.event
 
       if (name !== 'message.delta') {setLastEvent(name)}
 
-      if (name.startsWith('run.') || name === 'error') {
+      const terminalEvent =
+        name === 'run.completed' || name === 'run.failed' || name === 'run.cancelled'
+
+      if (terminalEvent || name === 'error') {
         unsubscribeRef.current?.()
         unsubscribeRef.current = null
-        client.status(runId).then(setRun, () => {
-          setLastEvent('connection lost — final state unknown')
-        })
+
+        const finalStatus = ownerSessionId
+          ? client.status(runId, ownerSessionId)
+          : client.status(runId)
+
+        finalStatus.then(
+          next => setRun({ ...next, ...(ownerSessionId && { sessionId: ownerSessionId }) }),
+          () => {
+            setLastEvent('connection lost — final state unknown')
+          }
+        )
       }
-    })
+    }
+
+    const unsubscribe = ownerSessionId
+      ? client.watch(runId, onEvent, ownerSessionId)
+      : client.watch(runId, onEvent)
 
     unsubscribeRef.current = unsubscribe
 
@@ -121,14 +174,21 @@ export function WorkRunTool({ args, result }: WorkRunToolProps) {
       unsubscribeRef.current?.()
       unsubscribeRef.current = null
     }
-  }, [client, live, runId])
+  }, [client, live, ownerSessionId, runId])
 
   const status: WorkhorseRunStatus | 'starting' = run?.status ?? 'starting'
   const active = run !== null && !isTerminal(run.status) && run.status !== 'stopping'
 
   const stop = () => {
     if (client && runId) {
-      client.stop(runId).then(setRun, () => setLastEvent('stop request failed'))
+      const stopping = ownerSessionId
+        ? client.stop(runId, ownerSessionId)
+        : client.stop(runId)
+
+      stopping.then(
+        next => setRun({ ...next, ...(ownerSessionId && { sessionId: ownerSessionId }) }),
+        () => setLastEvent('stop request failed')
+      )
     }
   }
 

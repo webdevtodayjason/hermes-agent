@@ -101,17 +101,23 @@ export function createWorkhorseClient({ profile, request }: CreateWorkhorseClien
 
       return response.data.map(mapRun)
     },
-    async status(runId: string): Promise<WorkhorseRun> {
-      const run = await call<RpcRun>('work.status', { run_id: runId, session_id: sessionId })
+    async status(runId: string, ownerSessionId?: string): Promise<WorkhorseRun> {
+      const run = await call<RpcRun>('work.status', {
+        run_id: runId,
+        session_id: ownerSessionId?.trim() || sessionId
+      })
 
       return mapRun(run)
     },
-    async stop(runId: string): Promise<WorkhorseRun> {
-      const run = await call<RpcRun>('work.stop', { run_id: runId, session_id: sessionId })
+    async stop(runId: string, ownerSessionId?: string): Promise<WorkhorseRun> {
+      const run = await call<RpcRun>('work.stop', {
+        run_id: runId,
+        session_id: ownerSessionId?.trim() || sessionId
+      })
 
       return mapRun(run)
     },
-    watch(runId: string, onEvent: (event: WorkhorseEvent) => void): () => void {
+    watch(runId: string, onEvent: (event: WorkhorseEvent) => void, ownerSessionId?: string): () => void {
       // Desktop's gateway does not expose per-run events yet. Poll the canonical
       // status RPC as the explicit degraded fallback and synthesize terminal events.
       let stopped = false
@@ -133,7 +139,12 @@ export function createWorkhorseClient({ profile, request }: CreateWorkhorseClien
         polling = true
 
         try {
-          const run = mapRun(await call<RpcRun>('work.status', { run_id: runId, session_id: sessionId }))
+          const run = mapRun(
+            await call<RpcRun>('work.status', {
+              run_id: runId,
+              session_id: ownerSessionId?.trim() || sessionId
+            })
+          )
 
           if (stopped) {
             return
