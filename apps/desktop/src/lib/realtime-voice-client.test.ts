@@ -18,11 +18,197 @@ function eventChannel() {
     }),
     emit(type: string, payload: unknown) {
       for (const listener of listeners.get(type) ?? []) {listener({ data: JSON.stringify(payload) })}
+    },
+    emitRaw(type: string, data: string) {
+      for (const listener of listeners.get(type) ?? []) {listener({ data })}
     }
   }
 }
 
 describe('createRealtimeVoiceClient', () => {
+  it('emits only normalized event identity diagnostics for valid provider events', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const onDiagnostic = vi.fn()
+
+    const client = createRealtimeVoiceClient({
+      sessionId: 'conversation-diagnostics',
+      onDiagnostic,
+      dependencies: {
+        createAudio: () => ({
+          autoplay: false,
+          srcObject: null,
+          pause: vi.fn(),
+          play: vi.fn(async () => undefined)
+        }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'minted-client-secret-sentinel',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-diagnostics',
+          sessionId: 'stored-diagnostics'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', {
+      type: '  provider.experimental_event  ',
+      item_id: 'item-1',
+      response_id: 'response-1',
+      call_id: 'call-1',
+      transcript: 'transcript-sentinel',
+      delta: 'delta-sentinel',
+      client_secret: 'event-client-secret-sentinel',
+      arguments: 'function-arguments-sentinel'
+    })
+    expect(onDiagnostic).toHaveBeenCalledOnce()
+    expect(onDiagnostic).toHaveBeenCalledWith({
+      type: 'provider.experimental_event',
+      itemId: 'item-1',
+      responseId: 'response-1',
+      callId: 'call-1'
+    })
+    expect(JSON.stringify(onDiagnostic.mock.calls)).not.toMatch(
+      /transcript-sentinel|delta-sentinel|client-secret-sentinel|function-arguments-sentinel/
+    )
+
+    channel.emit('message', null)
+    channel.emitRaw('message', '{malformed')
+    channel.emit('message', { type: 'x'.repeat(129) })
+    expect(onDiagnostic).toHaveBeenCalledOnce()
+
+    channel.emit('message', {
+      type: 'provider.safe_event',
+      item_id: 'i'.repeat(257),
+      response_id: 'r'.repeat(257),
+      call_id: 'c'.repeat(257)
+    })
+    expect(onDiagnostic).toHaveBeenCalledTimes(2)
+    expect(onDiagnostic).toHaveBeenLastCalledWith({ type: 'provider.safe_event' })
+
+    await client.end()
+  })
+
+  it('continues semantic handling when a diagnostic observer throws', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const statuses: string[] = []
+
+    const client = createRealtimeVoiceClient({
+      sessionId: 'conversation-diagnostic-isolation',
+      onDiagnostic: () => {throw new Error('diagnostic observer failed')},
+      onStatus: status => statuses.push(status),
+      dependencies: {
+        createAudio: () => ({
+          autoplay: false,
+          srcObject: null,
+          pause: vi.fn(),
+          play: vi.fn(async () => undefined)
+        }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-diagnostic-isolation',
+          sessionId: 'stored-diagnostic-isolation'
+        }))
+      }
+    })
+
+    await client.start()
+
+    expect(() => channel.emit('message', { type: 'response.created' })).not.toThrow()
+    expect(statuses.at(-1)).toBe('assistant-speaking')
+
+    await client.end()
+  })
+
+  it('stops semantic handling when a diagnostic observer ends the active attempt', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const statuses: string[] = []
+    const onAssistantTranscript = vi.fn()
+    let ending: Promise<void> | undefined
+    let client!: ReturnType<typeof createRealtimeVoiceClient>
+
+    client = createRealtimeVoiceClient({
+      sessionId: 'conversation-diagnostic-reentrancy',
+      onAssistantTranscript,
+      onDiagnostic: diagnostic => {
+        if (diagnostic.type === 'response.created') {ending = client.end()}
+      },
+      onStatus: status => statuses.push(status),
+      dependencies: {
+        createAudio: () => ({
+          autoplay: false,
+          srcObject: null,
+          pause: vi.fn(),
+          play: vi.fn(async () => undefined)
+        }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-diagnostic-reentrancy',
+          sessionId: 'stored-diagnostic-reentrancy'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', { type: 'response.created' })
+    await ending
+
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'stale-assistant', role: 'assistant' },
+      previous_item_id: null
+    })
+    channel.emit('message', {
+      type: 'response.output_audio_transcript.done',
+      item_id: 'stale-assistant',
+      transcript: 'must not publish'
+    })
+
+    expect(statuses).toEqual(['connecting', 'listening', 'idle'])
+    expect(onAssistantTranscript).not.toHaveBeenCalled()
+    expect(track.stop).toHaveBeenCalledOnce()
+  })
+
   it('does not revive a canceled start after microphone permission resolves', async () => {
     const track = { enabled: true, stop: vi.fn() }
     const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
@@ -193,6 +379,93 @@ describe('createRealtimeVoiceClient', () => {
     expect(peer.close).toHaveBeenCalledOnce()
     expect(audio.pause).toHaveBeenCalledOnce()
     expect(statuses.at(-1)).toBe('idle')
+  })
+
+  it('publishes added-item transcripts exactly once in provider order', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const transcripts: Array<[string, string, string]> = []
+
+    const client = createRealtimeVoiceClient({
+      sessionId: 'conversation-added-items',
+      onAssistantTranscript: (text, itemId) => transcripts.push(['assistant', text, itemId]),
+      onUserTranscript: (text, itemId) => transcripts.push(['user', text, itemId]),
+      dependencies: {
+        createAudio: () => ({
+          autoplay: false,
+          srcObject: null,
+          pause: vi.fn(),
+          play: vi.fn(async () => undefined)
+        }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-added-items',
+          sessionId: 'stored-added-items'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', { type: 'input_audio_buffer.speech_started', item_id: 'user-1' })
+    channel.emit('message', { type: 'input_audio_buffer.speech_stopped', item_id: 'user-1' })
+    channel.emit('message', { type: 'input_audio_buffer.committed', item_id: 'user-1' })
+    channel.emit('message', {
+      type: 'conversation.item.added',
+      item: { id: 'user-1', role: 'user' },
+      previous_item_id: null
+    })
+    channel.emit('message', {
+      type: 'conversation.item.done',
+      item: { id: 'user-1', role: 'user' }
+    })
+    channel.emit('message', { type: 'response.created', response: { id: 'response-1' } })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-1',
+      transcript: 'sentinel-user'
+    })
+    channel.emit('message', {
+      type: 'response.output_item.added',
+      item: { id: 'assistant-1', role: 'assistant' },
+      response_id: 'response-1'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.added',
+      item: { id: 'assistant-1', role: 'assistant' },
+      previous_item_id: 'user-1'
+    })
+    channel.emit('message', { type: 'response.content_part.added' })
+    channel.emit('message', {
+      type: 'response.output_audio_transcript.done',
+      item_id: 'assistant-1',
+      response_id: 'response-1',
+      transcript: 'sentinel-assistant'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.done',
+      item: { id: 'assistant-1', role: 'assistant' }
+    })
+    channel.emit('message', { type: 'response.done', response: { id: 'response-1' } })
+
+    expect(transcripts).toEqual([
+      ['user', 'sentinel-user', 'user-1'],
+      ['assistant', 'sentinel-assistant', 'assistant-1']
+    ])
+
+    await client.end()
   })
 
   it('publishes final transcripts and barges in without ending the live session', async () => {

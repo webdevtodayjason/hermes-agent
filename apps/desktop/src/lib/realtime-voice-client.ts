@@ -65,6 +65,13 @@ export interface RealtimeVoiceClient {
   setMuted(muted: boolean): void
 }
 
+export interface RealtimeVoiceDiagnostic {
+  type: string
+  itemId?: string
+  responseId?: string
+  callId?: string
+}
+
 export interface BackendRealtimeSessionGrant {
   client_secret: string
   expires_at?: number | null
@@ -169,12 +176,14 @@ export function createRealtimeTranscriptAppender({
 export function createRealtimeVoiceClient({
   dependencies,
   onAssistantTranscript,
+  onDiagnostic,
   onStatus,
   onUserTranscript,
   sessionId
 }: {
   dependencies: RealtimeVoiceDependencies
   onAssistantTranscript?: (text: string, itemId: string) => void
+  onDiagnostic?: (diagnostic: RealtimeVoiceDiagnostic) => void
   onStatus?: (status: RealtimeVoiceStatus) => void
   onUserTranscript?: (text: string, itemId: string) => void
   sessionId: string
@@ -205,6 +214,36 @@ export function createRealtimeVoiceClient({
   let muted = false
 
   const emitStatus = (status: RealtimeVoiceStatus) => onStatus?.(status)
+
+  const boundedIdentifier = (value: unknown) => {
+    if (typeof value !== 'string') {return undefined}
+    const identifier = value.trim()
+
+    return identifier && identifier.length <= 256 ? identifier : undefined
+  }
+
+  const emitDiagnostic = (event: Record<string, unknown>) => {
+    const type = typeof event.type === 'string' ? event.type.trim() : ''
+
+    if (!type || type.length > 128) {return}
+
+    const diagnostic: RealtimeVoiceDiagnostic = { type }
+    const itemId = boundedIdentifier(event.item_id ?? event.itemId)
+    const responseId = boundedIdentifier(event.response_id ?? event.responseId)
+    const callId = boundedIdentifier(event.call_id ?? event.callId)
+
+    if (itemId) {diagnostic.itemId = itemId}
+
+    if (responseId) {diagnostic.responseId = responseId}
+
+    if (callId) {diagnostic.callId = callId}
+
+    try {
+      onDiagnostic?.(diagnostic)
+    } catch {
+      // Diagnostics are optional observers and must not affect event handling.
+    }
+  }
 
   const isCurrent = (attempt: Attempt) => activeAttempt === attempt && !attempt.closed
 
@@ -351,17 +390,24 @@ export function createRealtimeVoiceClient({
 
   const handleServerEvent = (attempt: Attempt, raw: string) => {
     if (!isCurrent(attempt)) {return}
-    let event: Record<string, unknown>
+    let parsed: unknown
 
     try {
-      event = JSON.parse(raw) as Record<string, unknown>
+      parsed = JSON.parse(raw) as unknown
     } catch {
       return
     }
 
-    const type = typeof event.type === 'string' ? event.type : ''
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {return}
 
-    if (type === 'conversation.item.created') {
+    const event = parsed as Record<string, unknown>
+    emitDiagnostic(event)
+
+    if (!isCurrent(attempt)) {return}
+
+    const type = typeof event.type === 'string' ? event.type.trim() : ''
+
+    if (type === 'conversation.item.created' || type === 'conversation.item.added') {
       const item = event.item && typeof event.item === 'object'
         ? event.item as Record<string, unknown>
         : null
