@@ -75,6 +75,10 @@ export function useRealtimeConversation({
   // recreate the live audio session on every parent render.
   const onFatalErrorRef = useRef(onFatalError)
   onFatalErrorRef.current = onFatalError
+  // Exactly-once end per session: explicit end() and the effect cleanup
+  // both reach the same client (Sol's adapter-lifecycle finding). Each
+  // session's effect creates one once-guarded closure shared by both paths.
+  const endActiveRef = useRef<(() => Promise<void>) | null>(null)
 
   useEffect(() => {
     if (!enabled) {
@@ -98,6 +102,7 @@ export function useRealtimeConversation({
     }
 
     let cancelled = false
+    let ended = false
 
     const client = createClient({
       onStatus: providerStatus => {
@@ -108,7 +113,18 @@ export function useRealtimeConversation({
       sessionId
     })
 
+    const endOnce = (): Promise<void> => {
+      if (ended) {
+        return Promise.resolve()
+      }
+
+      ended = true
+
+      return client.end()
+    }
+
     clientRef.current = client
+    endActiveRef.current = endOnce
     mutedRef.current = false
     setMuted(false)
 
@@ -123,8 +139,13 @@ export function useRealtimeConversation({
     return () => {
       cancelled = true
       clientRef.current = null
+
+      if (endActiveRef.current === endOnce) {
+        endActiveRef.current = null
+      }
+
       setStatus('idle')
-      void client.end()
+      void endOnce()
     }
   }, [createClient, enabled, sessionId])
 
@@ -141,12 +162,13 @@ export function useRealtimeConversation({
   }, [])
 
   const end = useCallback(async () => {
-    const client = clientRef.current
+    const endActive = endActiveRef.current
+    endActiveRef.current = null
     clientRef.current = null
     setStatus('idle')
 
-    if (client) {
-      await client.end()
+    if (endActive) {
+      await endActive()
     }
   }, [])
 

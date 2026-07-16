@@ -133,3 +133,33 @@ describe('useRealtimeConversation', () => {
     expect(result.current.status).toBe('idle')
   })
 })
+
+describe('useRealtimeConversation end-exactly-once (Sol finding)', () => {
+  it('ends each client exactly once across explicit end() and disable/unmount', async () => {
+    const { client, factory } = makeFactory()
+
+    const { result, rerender, unmount } = renderHook(
+      ({ enabled }) =>
+        useRealtimeConversation({ createClient: factory, enabled, onFatalError: vi.fn(), sessionId: 's1' }),
+      { initialProps: { enabled: true } }
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalled())
+
+    await act(async () => {
+      await result.current.end()
+    })
+    expect(client.end).toHaveBeenCalledTimes(1)
+
+    rerender({ enabled: false })
+    await waitFor(() => expect(client.end).toHaveBeenCalledTimes(1))
+
+    rerender({ enabled: true })
+    await waitFor(() => expect(client.start).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      await result.current.end()
+    })
+    unmount()
+    expect(client.end).toHaveBeenCalledTimes(2)
+  })
+})

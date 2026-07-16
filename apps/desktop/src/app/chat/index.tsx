@@ -64,6 +64,7 @@ import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert, requestComposerInsertRefs } from './composer/focus'
+import type { RealtimeVoiceFactory } from './composer/hooks/use-realtime-conversation'
 import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from './composer/inline-refs'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
@@ -82,7 +83,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onAddUrl: (url: string) => void
   onBranchInNewChat: (messageId: string) => void
   maxVoiceRecordingSeconds?: number
-  realtimeVoiceFactory?: import('./composer/hooks/use-realtime-conversation').RealtimeVoiceFactory
+  realtimeVoiceFactory?: RealtimeVoiceFactory
   onAttachImageBlob: (blob: Blob) => Promise<boolean | void> | boolean | void
   onAttachDroppedItems: (candidates: DroppedFile[]) => Promise<boolean | void> | boolean | void
   onPasteClipboardImage: (opts?: { silent?: boolean }) => Promise<boolean> | void

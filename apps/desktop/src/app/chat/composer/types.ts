@@ -5,6 +5,8 @@ import type { ComposerAttachment } from '@/store/composer'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
+import type { RealtimeVoiceFactory } from './hooks/use-realtime-conversation'
+
 export interface ContextSuggestion {
   text: string
   display: string
@@ -36,7 +38,7 @@ export interface ChatBarProps {
   disabled: boolean
   focusKey?: string | null
   maxRecordingSeconds?: number
-  realtimeVoiceFactory?: import('./hooks/use-realtime-conversation').RealtimeVoiceFactory
+  realtimeVoiceFactory?: RealtimeVoiceFactory
   state: ChatBarState
   gateway?: HermesGateway | null
   queueSessionKey?: string | null
