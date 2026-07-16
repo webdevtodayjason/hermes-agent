@@ -1,25 +1,9 @@
-export type WorkhorseRunStatus =
-  | 'queued'
-  | 'running'
-  | 'waiting_for_approval'
-  | 'stopping'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-
-export interface WorkhorseRun {
-  runId: string
-  status: WorkhorseRunStatus
-  output?: string
-  error?: string
-  createdAt?: number
-  endedAt?: number
-}
-
-export interface WorkhorseEvent {
-  event: string
-  [key: string]: unknown
-}
+import type {
+  WorkhorseClient,
+  WorkhorseEvent,
+  WorkhorseRun,
+  WorkhorseRunStatus
+} from '../app/workhorse/workhorse-contract'
 
 export type WorkhorseClientErrorKind = 'invalid_request' | 'not_found' | 'unavailable' | 'unknown'
 
@@ -32,14 +16,6 @@ export class WorkhorseClientError extends Error {
     super(message)
     this.name = 'WorkhorseClientError'
   }
-}
-
-export interface WorkhorseClient {
-  startWork(input: string): Promise<WorkhorseRun>
-  recover(): Promise<WorkhorseRun[]>
-  status(runId: string): Promise<WorkhorseRun>
-  stop(runId: string): Promise<WorkhorseRun>
-  watch(runId: string, onEvent: (event: WorkhorseEvent) => void): () => void
 }
 
 export type WorkhorseRpcRequest = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
