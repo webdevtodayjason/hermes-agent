@@ -20,7 +20,6 @@ import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChat
 import {
   type BackendRealtimeSessionGrant,
   createBrowserRealtimeVoiceDependencies,
-  createRealtimeTranscriptAppender,
   createRealtimeVoiceClient
 } from '../lib/realtime-voice-client'
 import { storedSessionIdForNotification } from '../lib/session-ids'
@@ -498,36 +497,11 @@ export function DesktopController() {
         })
     })
 
-    return ({ onFatalError, onStatus, sessionId }) => {
-      const appendTranscript = createRealtimeTranscriptAppender({
-        append: ({ itemId, role, text }) =>
-          requestGateway('voice.transcript.append', {
-            item_id: itemId,
-            role,
-            session_id: sessionId,
-            text
-          }),
-        onError: error => {
-          console.error('Realtime transcript persistence failed after retries', error)
-          onFatalError(error)
-        }
-      })
-
-      const persistTranscript = (role: 'assistant' | 'user', text: string, itemId: string) => {
-        void appendTranscript({ itemId, role, text }).catch(error => {
-          console.error('Realtime transcript queue rejected', error)
-        })
-      }
-
+    return ({ onStatus, onUserTranscript, sessionId }) => {
       return createRealtimeVoiceClient({
         dependencies,
-        onAssistantTranscript: (text, itemId) => {
-          persistTranscript('assistant', text, itemId)
-        },
         onStatus,
-        onUserTranscript: (text, itemId) => {
-          persistTranscript('user', text, itemId)
-        },
+        onUserTranscript,
         sessionId
       })
     }

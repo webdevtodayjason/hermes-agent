@@ -51,7 +51,7 @@ def mint_realtime_session(session_id: str, profile: str | None = None) -> dict[s
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "create_response": True,
+                        "create_response": False,
                         "interrupt_response": True,
                         "silence_duration_ms": 500,
                     },

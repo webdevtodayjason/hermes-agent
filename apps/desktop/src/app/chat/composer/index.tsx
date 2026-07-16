@@ -1,6 +1,6 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useEffect, useRef } from 'react'
+import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef } from 'react'
 
 import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils'
 import { $composerAttachments } from '@/store/composer'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
-import { removeQueuedPrompt } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, removeQueuedPrompt } from '@/store/composer-queue'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
 import { $gatewayState, $messages } from '@/store/session'
@@ -42,6 +42,7 @@ import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
 import { useComposerVoice } from './hooks/use-composer-voice'
 import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
+import { handoffFinalizedVoiceTranscript } from './hooks/voice-transcript-handoff'
 import { QueuePanel } from './queue-panel'
 import {
   composerPlainText,
@@ -646,6 +647,18 @@ export function ChatBar({
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
   useComposerEscCancel({ awaitingInput, busy, onCancel })
 
+  const onVoiceUserTranscript = useCallback(
+    (text: string) =>
+      handoffFinalizedVoiceTranscript({
+        activeQueueSessionKey,
+        busy,
+        enqueue: enqueueQueuedPrompt,
+        onSubmit,
+        text
+      }),
+    [activeQueueSessionKey, busy, onSubmit]
+  )
+
   const {
     conversation,
     dictate,
@@ -660,6 +673,7 @@ export function ChatBar({
     focusInput,
     insertText,
     maxRecordingSeconds,
+    onUserTranscript: onVoiceUserTranscript,
     onTranscribeAudio,
     realtimeVoiceFactory,
     sessionId

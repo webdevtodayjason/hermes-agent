@@ -41,6 +41,7 @@ export interface RealtimeVoiceFactoryOptions {
   sessionId: string
   onFatalError: (error: unknown) => void
   onStatus: (status: RealtimeVoiceStatus) => void
+  onUserTranscript: (text: string, itemId: string) => void
 }
 
 export type RealtimeVoiceFactory = (options: RealtimeVoiceFactoryOptions) => RealtimeVoiceClientLike
@@ -49,6 +50,7 @@ interface UseRealtimeConversationArgs {
   createClient: RealtimeVoiceFactory | undefined
   enabled: boolean
   onFatalError: (error: unknown) => void
+  onUserTranscript: (text: string, itemId: string) => Promise<unknown> | void
   sessionId: string | null | undefined
 }
 
@@ -66,6 +68,7 @@ export function useRealtimeConversation({
   createClient,
   enabled,
   onFatalError,
+  onUserTranscript,
   sessionId
 }: UseRealtimeConversationArgs) {
   const [status, setStatus] = useState<ConversationStatus>('idle')
@@ -76,6 +79,8 @@ export function useRealtimeConversation({
   // recreate the live audio session on every parent render.
   const onFatalErrorRef = useRef(onFatalError)
   onFatalErrorRef.current = onFatalError
+  const onUserTranscriptRef = useRef({ handler: onUserTranscript, sessionId })
+  onUserTranscriptRef.current = { handler: onUserTranscript, sessionId }
   // Exactly-once end per session: explicit end() and the effect cleanup
   // both reach the same client (Sol's adapter-lifecycle finding). Each
   // session's effect creates one once-guarded closure shared by both paths.
@@ -116,47 +121,63 @@ export function useRealtimeConversation({
       return client?.end() ?? Promise.resolve()
     }
 
+    const closeOnce = (): Promise<void> => {
+      cancelled = true
+
+      return endOnce()
+    }
+
+    const failOnce = (error: unknown) => {
+      if (cancelled) {
+        return
+      }
+
+      cancelled = true
+      setStatus('idle')
+      clientRef.current = null
+      void endOnce().catch(() => undefined)
+      onFatalErrorRef.current(error)
+    }
+
     client = createClient({
-      onFatalError: error => {
-        if (!cancelled) {
-          cancelled = true
-          setStatus('idle')
-          clientRef.current = null
-          void endOnce()
-          onFatalErrorRef.current(error)
-        }
-      },
+      onFatalError: failOnce,
       onStatus: providerStatus => {
         if (!cancelled) {
           setStatus(STATUS_MAP[providerStatus] ?? 'idle')
+        }
+      },
+      onUserTranscript: (text, itemId) => {
+        const current = onUserTranscriptRef.current
+
+        if (!cancelled && current.sessionId === sessionId) {
+          try {
+            void Promise.resolve(current.handler(text, itemId)).catch(failOnce)
+          } catch (error) {
+            failOnce(error)
+          }
         }
       },
       sessionId
     })
 
     clientRef.current = client
-    endActiveRef.current = endOnce
+    endActiveRef.current = closeOnce
     mutedRef.current = false
     setMuted(false)
 
     client.start().catch((error: unknown) => {
-      if (!cancelled) {
-        setStatus('idle')
-        clientRef.current = null
-        onFatalErrorRef.current(error)
-      }
+      failOnce(error)
     })
 
     return () => {
-      cancelled = true
       clientRef.current = null
 
-      if (endActiveRef.current === endOnce) {
+      if (endActiveRef.current === closeOnce) {
         endActiveRef.current = null
       }
 
       setStatus('idle')
-      void endOnce()
+      void closeOnce().catch(error => onFatalErrorRef.current(error))
     }
   }, [createClient, enabled, sessionId])
 
@@ -179,7 +200,11 @@ export function useRealtimeConversation({
     setStatus('idle')
 
     if (endActive) {
-      await endActive()
+      try {
+        await endActive()
+      } catch (error) {
+        onFatalErrorRef.current(error)
+      }
     }
   }, [])
 

@@ -18,6 +18,7 @@ interface UseComposerVoiceArgs {
   focusInput: () => void
   insertText: (text: string) => void
   maxRecordingSeconds: number
+  onUserTranscript: (text: string, itemId: string) => Promise<unknown> | void
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   realtimeVoiceFactory?: RealtimeVoiceFactory
   sessionId: string | null | undefined
@@ -35,6 +36,7 @@ export function useComposerVoice({
   focusInput,
   insertText,
   maxRecordingSeconds,
+  onUserTranscript,
   onTranscribeAudio,
   realtimeVoiceFactory,
   sessionId
@@ -92,6 +94,7 @@ export function useComposerVoice({
     createClient: realtimeVoiceFactory,
     enabled: voiceConversationActive,
     onFatalError: onVoiceFatalError,
+    onUserTranscript,
     sessionId
   })
 
