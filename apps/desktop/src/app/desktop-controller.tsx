@@ -497,11 +497,12 @@ export function DesktopController() {
         })
     })
 
-    return ({ onStatus, onUserTranscript, sessionId }) => {
+    return ({ onStatus, onUserTranscript, onUserTranscriptDelta, sessionId }) => {
       return createRealtimeVoiceClient({
         dependencies,
         onStatus,
         onUserTranscript,
+        onUserTranscriptDelta,
         sessionId
       })
     }

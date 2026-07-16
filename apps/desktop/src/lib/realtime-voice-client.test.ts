@@ -26,6 +26,270 @@ function eventChannel() {
 }
 
 describe('createRealtimeVoiceClient', () => {
+  it('streams cumulative user caption deltas without changing finalized transcript delivery', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const captions: Array<[string, string]> = []
+    const finals: Array<[string, string]> = []
+
+    const client = createRealtimeVoiceClient({
+      sessionId: 'conversation-captions',
+      onUserTranscriptDelta: (text, itemId) => {
+        captions.push([text, itemId])
+
+        if (text === 'Hello world.') {
+          throw new Error('caption observer failed')
+        }
+      },
+      onUserTranscript: (text, itemId) => finals.push([text, itemId]),
+      dependencies: {
+        createAudio: () => ({
+          autoplay: false,
+          srcObject: null,
+          pause: vi.fn(),
+          play: vi.fn(async () => undefined)
+        }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-captions',
+          sessionId: 'stored-captions'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-caption-1', role: 'user' },
+      previous_item_id: null
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-caption-1',
+      delta: 'Hello'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-caption-1',
+      delta: ' world'
+    })
+
+    expect(captions).toEqual([
+      ['Hello', 'user-caption-1'],
+      ['Hello world', 'user-caption-1']
+    ])
+    expect(finals).toEqual([])
+
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-caption-1',
+      transcript: 'Hello world.'
+    })
+
+    expect(captions.at(-1)).toEqual(['Hello world.', 'user-caption-1'])
+    expect(finals).toEqual([['Hello world.', 'user-caption-1']])
+
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-caption-1',
+      transcript: 'Duplicate final.'
+    })
+    expect(captions.at(-1)).toEqual(['Hello world.', 'user-caption-1'])
+    expect(finals).toEqual([['Hello world.', 'user-caption-1']])
+
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-caption-1',
+      delta: 'Late fragment'
+    })
+    expect(captions.at(-1)).toEqual(['Hello world.', 'user-caption-1'])
+
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-empty-final', role: 'user' },
+      previous_item_id: 'user-caption-1'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-empty-final',
+      delta: 'Unconfirmed partial'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-empty-final',
+      transcript: ''
+    })
+    expect(captions.at(-1)).toEqual(['', 'user-empty-final'])
+    expect(finals).toEqual([['Hello world.', 'user-caption-1']])
+
+    await client.end()
+  })
+
+  it('does not let an older transcription item overwrite captions for a newer turn', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const captions: Array<[string, string]> = []
+    const finals: Array<[string, string]> = []
+
+    const client = createRealtimeVoiceClient({
+      sessionId: 'conversation-caption-order',
+      onUserTranscriptDelta: (text, itemId) => captions.push([text, itemId]),
+      onUserTranscript: (text, itemId) => finals.push([text, itemId]),
+      dependencies: {
+        createAudio: () => ({ autoplay: false, srcObject: null, pause: vi.fn(), play: vi.fn(async () => undefined) }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-caption-order',
+          sessionId: 'stored-caption-order'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-old', role: 'user' },
+      previous_item_id: null
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-old',
+      delta: 'Old partial'
+    })
+    channel.emit('message', { type: 'input_audio_buffer.speech_started' })
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-new', role: 'user' },
+      previous_item_id: 'user-old'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-new',
+      delta: 'New partial'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-old',
+      transcript: 'Old final.'
+    })
+
+    expect(captions.at(-1)).toEqual(['New partial', 'user-new'])
+    expect(finals).toEqual([['Old final.', 'user-old']])
+
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-new',
+      transcript: 'New final.'
+    })
+    expect(captions.at(-1)).toEqual(['New final.', 'user-new'])
+    expect(finals).toEqual([
+      ['Old final.', 'user-old'],
+      ['New final.', 'user-new']
+    ])
+
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-no-caption', role: 'user' },
+      previous_item_id: 'user-new'
+    })
+    channel.emit('message', { type: 'input_audio_buffer.speech_started' })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-no-caption',
+      transcript: 'Delayed prior final.'
+    })
+    expect(captions.at(-1)).toEqual(['New final.', 'user-new'])
+    expect(finals.at(-1)).toEqual(['Delayed prior final.', 'user-no-caption'])
+
+    await client.end()
+  })
+
+  it('stops canonical completion when a caption observer retires the active attempt', async () => {
+    const track = { enabled: true, stop: vi.fn() }
+    const stream = { getTracks: () => [track], getAudioTracks: () => [track] }
+    const channel = eventChannel()
+    const onUserTranscript = vi.fn()
+    let ending: Promise<void> | undefined
+    let client!: ReturnType<typeof createRealtimeVoiceClient>
+
+    client = createRealtimeVoiceClient({
+      sessionId: 'conversation-caption-reentrancy',
+      onUserTranscriptDelta: text => {
+        if (text === 'Final caption.') {
+          ending = client.end()
+        }
+      },
+      onUserTranscript,
+      dependencies: {
+        createAudio: () => ({ autoplay: false, srcObject: null, pause: vi.fn(), play: vi.fn(async () => undefined) }),
+        createPeerConnection: () => ({
+          addTrack: vi.fn(),
+          close: vi.fn(),
+          createDataChannel: () => channel,
+          createOffer: vi.fn(async () => ({ type: 'offer', sdp: 'offer' })),
+          setLocalDescription: vi.fn(async () => undefined),
+          setRemoteDescription: vi.fn(async () => undefined),
+          ontrack: null
+        }),
+        exchangeSdp: vi.fn(async () => 'answer'),
+        getUserMedia: vi.fn(async () => stream),
+        mintSession: vi.fn(async () => ({
+          clientSecret: 'ek_ephemeral',
+          model: 'gpt-realtime-2.1',
+          ownerSessionId: 'conversation-caption-reentrancy',
+          sessionId: 'stored-caption-reentrancy'
+        }))
+      }
+    })
+
+    await client.start()
+    channel.emit('message', {
+      type: 'conversation.item.created',
+      item: { id: 'user-reentrant', role: 'user' },
+      previous_item_id: null
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.delta',
+      item_id: 'user-reentrant',
+      delta: 'Partial caption'
+    })
+    channel.emit('message', {
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user-reentrant',
+      transcript: 'Final caption.'
+    })
+
+    await ending
+    await Promise.resolve()
+    expect(onUserTranscript).not.toHaveBeenCalled()
+  })
+
   it('emits only normalized event identity diagnostics for valid provider events', async () => {
     const track = { enabled: true, stop: vi.fn() }
     const stream = { getTracks: () => [track], getAudioTracks: () => [track] }

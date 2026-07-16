@@ -41,6 +41,7 @@ export interface RealtimeVoiceFactoryOptions {
   sessionId: string
   onFatalError: (error: unknown) => void
   onStatus: (status: RealtimeVoiceStatus) => void
+  onUserTranscriptDelta?: (text: string, itemId: string) => void
   onUserTranscript: (text: string, itemId: string) => void
 }
 
@@ -66,6 +67,26 @@ const STATUS_MAP: Record<RealtimeVoiceStatus, ConversationStatus> = {
   error: 'idle'
 }
 
+const MAX_RETIRED_CAPTION_ITEMS = 64
+
+function retireCaptionItem(retired: Set<string>, itemId: string | null) {
+  if (!itemId) {
+    return
+  }
+
+  retired.add(itemId)
+
+  while (retired.size > MAX_RETIRED_CAPTION_ITEMS) {
+    const oldest = retired.values().next().value
+
+    if (typeof oldest !== 'string') {
+      break
+    }
+
+    retired.delete(oldest)
+  }
+}
+
 export function useRealtimeConversation({
   createClient,
   enabled,
@@ -75,13 +96,23 @@ export function useRealtimeConversation({
   sessionId
 }: UseRealtimeConversationArgs) {
   const [status, setStatus] = useState<ConversationStatus>('idle')
+  const [liveTranscript, setLiveTranscript] = useState('')
   const [muted, setMuted] = useState(false)
   const [userSpeaking, setUserSpeaking] = useState(false)
+  const liveTranscriptItemRef = useRef<string | null>(null)
+  const retiredCaptionItemsRef = useRef(new Set<string>())
   const userSpeakingRef = useRef(false)
   const narrationBlockRef = useRef<{ generation: number } | null>(null)
   const playbackStopRef = useRef<{ generation: number } | null>(null)
   const clientRef = useRef<RealtimeVoiceClientLike | null>(null)
   const mutedRef = useRef(false)
+
+  const clearLiveTranscript = useCallback(() => {
+    setLiveTranscript('')
+    liveTranscriptItemRef.current = null
+    retiredCaptionItemsRef.current.clear()
+  }, [])
+
   // Latest-ref: a non-memoized error callback must not tear down and
   // recreate the live audio session on every parent render.
   const onFatalErrorRef = useRef(onFatalError)
@@ -124,9 +155,10 @@ export function useRealtimeConversation({
       userSpeakingRef.current = false
       setMuted(false)
       setStatus('idle')
+      clearLiveTranscript()
       setUserSpeaking(false)
     }
-  }, [createClient, enabled, onBargeIn, onFatalError, onUserTranscript, sessionId])
+  }, [clearLiveTranscript, createClient, enabled, onBargeIn, onFatalError, onUserTranscript, sessionId])
 
   // Exactly-once end per session: explicit end() and the effect cleanup
   // both reach the same client (Sol's adapter-lifecycle finding). Each
@@ -276,6 +308,7 @@ export function useRealtimeConversation({
 
       cancelled = true
       setStatus('idle')
+      clearLiveTranscript()
       updateUserSpeaking(false)
       clientRef.current = null
       stopPlaybackForClose()
@@ -292,6 +325,9 @@ export function useRealtimeConversation({
             updateUserSpeaking(providerStatus === 'user-speaking')
 
             if (providerStatus === 'user-speaking') {
+              retireCaptionItem(retiredCaptionItemsRef.current, liveTranscriptItemRef.current)
+              liveTranscriptItemRef.current = null
+              setLiveTranscript('')
               vadPlaybackStop = { generation: activeGeneration }
               playbackStopRef.current = vadPlaybackStop
               stopPlayback(activeGeneration)
@@ -300,6 +336,24 @@ export function useRealtimeConversation({
               vadPlaybackStop = null
             }
           }
+        },
+        onUserTranscriptDelta: (text, itemId) => {
+          if (
+            !factorySettled ||
+            cancelled ||
+            !ownsLifecycle() ||
+            !itemId ||
+            retiredCaptionItemsRef.current.has(itemId)
+          ) {
+            return
+          }
+
+          if (liveTranscriptItemRef.current !== itemId) {
+            retireCaptionItem(retiredCaptionItemsRef.current, liveTranscriptItemRef.current)
+            liveTranscriptItemRef.current = itemId
+          }
+
+          setLiveTranscript(text)
         },
         onUserTranscript: (text, itemId) => {
           const current = onUserTranscriptRef.current
@@ -359,6 +413,7 @@ export function useRealtimeConversation({
 
       if (ownsLifecycle()) {
         setStatus('idle')
+        clearLiveTranscript()
         updateUserSpeaking(false)
       }
 
@@ -368,7 +423,7 @@ export function useRealtimeConversation({
         }
       })
     }
-  }, [blockNarration, createClient, enabled, invokePlaybackStop, sessionId, stopPlayback, updateUserSpeaking])
+  }, [blockNarration, clearLiveTranscript, createClient, enabled, invokePlaybackStop, sessionId, stopPlayback, updateUserSpeaking])
 
   // Barge-in: stop canonical narration and provider output, keep durable work alive.
   const stopTurn = useCallback(() => {
@@ -429,6 +484,7 @@ export function useRealtimeConversation({
     endActiveRef.current = null
     clientRef.current = null
     setStatus('idle')
+    clearLiveTranscript()
     updateUserSpeaking(false)
 
     if (endActive) {
@@ -440,7 +496,7 @@ export function useRealtimeConversation({
         }
       }
     }
-  }, [updateUserSpeaking])
+  }, [clearLiveTranscript, updateUserSpeaking])
 
   return {
     end,
@@ -449,6 +505,7 @@ export function useRealtimeConversation({
     // The Realtime transport carries no analyzer level yet; speaking states
     // drive the visualization instead. A future level feed slots in here.
     level: 0,
+    liveTranscript,
     muted,
     status,
     stopTurn,

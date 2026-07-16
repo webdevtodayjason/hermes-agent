@@ -147,6 +147,7 @@ export function useComposerVoice({
     dictate,
     endConversation,
     handleToggleAutoSpeak,
+    liveTranscript: conversation.liveTranscript,
     startConversation,
     voiceActivityState,
     voiceConversationActive,

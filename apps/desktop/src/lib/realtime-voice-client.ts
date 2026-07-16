@@ -178,6 +178,7 @@ export function createRealtimeVoiceClient({
   onAssistantTranscript,
   onDiagnostic,
   onStatus,
+  onUserTranscriptDelta,
   onUserTranscript,
   sessionId
 }: {
@@ -185,6 +186,8 @@ export function createRealtimeVoiceClient({
   onAssistantTranscript?: (text: string, itemId: string) => void
   onDiagnostic?: (diagnostic: RealtimeVoiceDiagnostic) => void
   onStatus?: (status: RealtimeVoiceStatus) => void
+  /** Ephemeral, renderer-only cumulative input transcription for live captions. */
+  onUserTranscriptDelta?: (text: string, itemId: string) => void
   onUserTranscript?: (text: string, itemId: string) => void
   sessionId: string
 }): RealtimeVoiceClient {
@@ -193,6 +196,7 @@ export function createRealtimeVoiceClient({
     audio: AudioLike | null
     channel: DataChannelLike | null
     closed: boolean
+    latestUserTranscriptItemId: string | null
     peer: PeerConnectionLike | null
     responseActive: boolean
     settledTranscriptIds: Set<string>
@@ -200,6 +204,7 @@ export function createRealtimeVoiceClient({
     stream: MediaStreamLike | null
     transcriptItems: Map<string, TranscriptItem>
     transcriptOrder: string[]
+    userTranscriptBuffers: Map<string, string>
   }
 
   interface TranscriptItem {
@@ -214,6 +219,15 @@ export function createRealtimeVoiceClient({
   let muted = false
 
   const emitStatus = (status: RealtimeVoiceStatus) => onStatus?.(status)
+
+  const emitUserTranscriptDelta = (text: string, itemId: string) => {
+    try {
+      onUserTranscriptDelta?.(text, itemId)
+    } catch {
+      // Captions are an optional presentation observer. They must never block
+      // authoritative finalized transcript delivery.
+    }
+  }
 
   const boundedIdentifier = (value: unknown) => {
     if (typeof value !== 'string') {return undefined}
@@ -422,6 +436,10 @@ export function createRealtimeVoiceClient({
       if (itemId && (role === 'assistant' || role === 'user')) {
         registerTranscriptItem(attempt, itemId, role, previousItemId)
 
+        if (role === 'user') {
+          attempt.latestUserTranscriptItemId = itemId
+        }
+
         if (role === 'assistant' && attempt.skipAssistantItemsUntilNextResponse) {
           skipTranscriptItem(attempt, itemId, role)
         }
@@ -449,26 +467,63 @@ export function createRealtimeVoiceClient({
       attempt.responseActive = false
       emitStatus('listening')
     } else if (type === 'input_audio_buffer.speech_started') {
+      attempt.latestUserTranscriptItemId = null
       interruptPlayback(attempt)
       emitStatus('user-speaking')
     } else if (type === 'input_audio_buffer.speech_stopped') {
       void attempt.audio?.play().catch(() => undefined)
       emitStatus('listening')
-    } else if (type === 'conversation.item.input_audio_transcription.completed') {
-      const transcript = String(event.transcript || '').trim()
+    } else if (type === 'conversation.item.input_audio_transcription.delta') {
       const itemId = typeof event.item_id === 'string' ? event.item_id : ''
+      const delta = typeof event.delta === 'string' ? event.delta : ''
+
+      if (itemId && delta && !attempt.settledTranscriptIds.has(itemId)) {
+        const transcript = `${attempt.userTranscriptBuffers.get(itemId) ?? ''}${delta}`
+        attempt.userTranscriptBuffers.set(itemId, transcript)
+
+        if (attempt.latestUserTranscriptItemId === itemId) {
+          emitUserTranscriptDelta(transcript, itemId)
+        }
+      }
+    } else if (type === 'conversation.item.input_audio_transcription.completed') {
+      const itemId = typeof event.item_id === 'string' ? event.item_id : ''
+
+      if (attempt.settledTranscriptIds.has(itemId)) {return}
+      const transcript = String(event.transcript || '').trim()
+      attempt.userTranscriptBuffers.delete(itemId)
 
       if (itemId) {
         if (transcript) {
+          if (attempt.latestUserTranscriptItemId === itemId) {
+            emitUserTranscriptDelta(transcript, itemId)
+          }
+
+          if (!isCurrent(attempt)) {return}
           completeTranscriptItem(attempt, itemId, 'user', transcript)
         } else {
+          if (attempt.latestUserTranscriptItemId === itemId) {
+            emitUserTranscriptDelta('', itemId)
+          }
+
+          if (!isCurrent(attempt)) {return}
           skipTranscriptItem(attempt, itemId, 'user')
         }
       }
     } else if (type === 'conversation.item.input_audio_transcription.failed') {
       const itemId = typeof event.item_id === 'string' ? event.item_id : ''
 
-      if (itemId) {skipTranscriptItem(attempt, itemId, 'user')}
+      if (attempt.settledTranscriptIds.has(itemId)) {return}
+
+      if (itemId) {
+        attempt.userTranscriptBuffers.delete(itemId)
+
+        if (attempt.latestUserTranscriptItemId === itemId) {
+          emitUserTranscriptDelta('', itemId)
+        }
+
+        if (!isCurrent(attempt)) {return}
+        skipTranscriptItem(attempt, itemId, 'user')
+      }
     }
   }
 
@@ -508,13 +563,15 @@ export function createRealtimeVoiceClient({
         audio: null,
         channel: null,
         closed: false,
+        latestUserTranscriptItemId: null,
         peer: null,
         responseActive: false,
         settledTranscriptIds: new Set(),
         skipAssistantItemsUntilNextResponse: false,
         stream: null,
         transcriptItems: new Map(),
-        transcriptOrder: []
+        transcriptOrder: [],
+        userTranscriptBuffers: new Map()
       }
 
       activeAttempt = attempt

@@ -59,6 +59,7 @@ import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
 import { UrlDialog } from './url-dialog'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
+import { VoiceCaptions } from './voice-captions'
 
 export function ChatBar({
   busy,
@@ -664,6 +665,7 @@ export function ChatBar({
     dictate,
     endConversation,
     handleToggleAutoSpeak,
+    liveTranscript,
     startConversation,
     voiceActivityState,
     voiceConversationActive,
@@ -948,6 +950,13 @@ export function ChatBar({
                 )}
                 data-slot="composer-fade"
               >
+                {voiceConversationActive && (
+                  <VoiceCaptions
+                    active
+                    status={conversation.status}
+                    transcript={liveTranscript}
+                  />
+                )}
                 <VoiceActivity state={voiceActivityState} />
                 <VoicePlaybackActivity />
                 {queueEdit && editingQueuedPrompt && (

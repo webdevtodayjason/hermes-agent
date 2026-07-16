@@ -14,6 +14,7 @@ afterEach(cleanup)
 function makeFactory() {
   const onStatuses: ((status: RealtimeVoiceStatus) => void)[] = []
   const onClientFatalErrors: ((error: unknown) => void)[] = []
+  const onUserTranscriptDeltas: ((text: string, itemId: string) => void)[] = []
   const onUserTranscripts: ((text: string, itemId: string) => void)[] = []
 
   const client: RealtimeVoiceClientLike = {
@@ -32,6 +33,10 @@ function makeFactory() {
       (options as typeof options & { onUserTranscript?: (text: string, itemId: string) => void })
         .onUserTranscript ?? (() => undefined)
     )
+    onUserTranscriptDeltas.push(
+      (options as typeof options & { onUserTranscriptDelta?: (text: string, itemId: string) => void })
+        .onUserTranscriptDelta ?? (() => undefined)
+    )
 
     return client
   })
@@ -41,6 +46,8 @@ function makeFactory() {
     factory,
     emit: (status: RealtimeVoiceStatus, clientIndex = onStatuses.length - 1) =>
       onStatuses[clientIndex]?.(status),
+    emitUserDelta: (text: string, itemId: string, clientIndex = onUserTranscriptDeltas.length - 1) =>
+      onUserTranscriptDeltas[clientIndex]?.(text, itemId),
     emitUser: (text: string, itemId: string, clientIndex = onUserTranscripts.length - 1) =>
       onUserTranscripts[clientIndex]?.(text, itemId),
     fail: (error: unknown, clientIndex = onClientFatalErrors.length - 1) =>
@@ -49,6 +56,86 @@ function makeFactory() {
 }
 
 describe('useRealtimeConversation', () => {
+  it('exposes ephemeral live captions and clears them on end and session replacement', async () => {
+    const { client, emitUserDelta, factory } = makeFactory()
+    const onUserTranscript = vi.fn()
+
+    const { result, rerender } = renderHook(
+      ({ enabled, sessionId }) =>
+        useRealtimeConversation({
+          createClient: factory,
+          enabled,
+          onFatalError: vi.fn(),
+          onUserTranscript,
+          sessionId
+        }),
+      { initialProps: { enabled: true, sessionId: 's1' } }
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalledTimes(1))
+    act(() => emitUserDelta('Live caption', 'item-1'))
+    expect(result.current.liveTranscript).toBe('Live caption')
+
+    rerender({ enabled: true, sessionId: 's2' })
+    await waitFor(() => expect(factory).toHaveBeenCalledTimes(2))
+    expect(result.current.liveTranscript).toBe('')
+    act(() => emitUserDelta('stale caption', 'item-1', 0))
+    expect(result.current.liveTranscript).toBe('')
+
+    act(() => emitUserDelta('New caption', 'item-2', 1))
+    expect(result.current.liveTranscript).toBe('New caption')
+    rerender({ enabled: false, sessionId: 's2' })
+    await waitFor(() => expect(result.current.liveTranscript).toBe(''))
+  })
+
+  it('ignores caption callbacks from a retired item after a newer speech turn begins', async () => {
+    const { client, emit, emitUserDelta, factory } = makeFactory()
+
+    const { result } = renderHook(() =>
+      useRealtimeConversation({
+        createClient: factory,
+        enabled: true,
+        onFatalError: vi.fn(),
+        onUserTranscript: vi.fn(),
+        sessionId: 's1'
+      })
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalledTimes(1))
+    act(() => emitUserDelta('Old partial', 'item-old'))
+    expect(result.current.liveTranscript).toBe('Old partial')
+
+    act(() => emit('user-speaking'))
+    expect(result.current.liveTranscript).toBe('')
+    act(() => emitUserDelta('New partial', 'item-new'))
+    act(() => emitUserDelta('Old final.', 'item-old'))
+
+    expect(result.current.liveTranscript).toBe('New partial')
+  })
+
+  it('clears ephemeral captions immediately on a fatal transport error', async () => {
+    const { client, emitUserDelta, fail, factory } = makeFactory()
+    const onFatalError = vi.fn()
+
+    const { result } = renderHook(() =>
+      useRealtimeConversation({
+        createClient: factory,
+        enabled: true,
+        onFatalError,
+        onUserTranscript: vi.fn(),
+        sessionId: 's1'
+      })
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalledTimes(1))
+    act(() => emitUserDelta('Caption before failure', 'item-1'))
+    expect(result.current.liveTranscript).toBe('Caption before failure')
+
+    act(() => fail(new Error('transport failed')))
+    expect(result.current.liveTranscript).toBe('')
+    expect(onFatalError).toHaveBeenCalledOnce()
+  })
+
   it('keeps committed callbacks active when a replacement render suspends', async () => {
     const { client, emit, emitUser, factory } = makeFactory()
     const firstBargeIn = vi.fn()
