@@ -31,6 +31,11 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_work_toolset_exposes_model_callable_durable_controls(self):
+        ts = get_toolset("work")
+        assert ts is not None
+        assert ts["tools"] == ["work_start", "work_status", "work_stop"]
+
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(

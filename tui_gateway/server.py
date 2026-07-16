@@ -2114,13 +2114,19 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        durable_session_id = session_key
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    durable_session_id = _session_lookup_key(
+                        sess,
+                        fallback=session_key,
+                    )
                     break
         return set_session_vars(
             session_key=session_key,
+            session_id=durable_session_id,
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
@@ -2778,11 +2784,11 @@ def _load_enabled_toolsets() -> list[str] | None:
 
             selection = coding_selection(platform=_resolve_session_platform())
             if selection is not None:
-                # Fold in `project` here too: this is a GUI-only resolver, and
-                # the focus-mode coding posture returns before the fallback path
-                # that normally adds it — without this the desktop loses the
-                # project tools exactly when sitting in a repo (see below).
-                return sorted({*selection, "project"})
+                # Fold in `project` and `work` here too: this is a GUI-only
+                # resolver, and the focus-mode coding posture returns before the
+                # fallback path that normally adds them. Without this, the
+                # desktop loses project and durable-work tools in a repo.
+                return sorted({*selection, "project", "work"})
         except Exception:
             pass
 
@@ -2893,13 +2899,12 @@ def _load_enabled_toolsets() -> list[str] | None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
             return None
-        # The desktop Project tools are off _HERMES_CORE_TOOLS (every other
-        # platform would carry their schema for nothing), so the platform
-        # recovery above — which keys off hermes-cli's tool universe — can't
-        # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
-        # folding in the `project` toolset here is the gate that exposes them on
-        # exactly the surface that can follow a project move.
-        return sorted(enabled | {"project"})
+        # Desktop-only project and durable-work tools stay off
+        # _HERMES_CORE_TOOLS so every messaging platform does not carry their
+        # schemas. This resolver runs only in the Desktop/TUI gateway, making it
+        # the narrow gate for surfaces that can follow project moves and return
+        # durable results to a live parent conversation.
+        return sorted(enabled | {"project", "work"})
     except Exception:
         if fallback_notice is not None:
             print(

@@ -89,6 +89,38 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+@pytest.mark.parametrize(
+    ("agent_session_id", "expected_session_id"),
+    [(None, "stored-session"), ("rotated-session", "rotated-session")],
+)
+def test_session_context_binds_trusted_durable_identity(
+    agent_session_id, expected_session_id
+):
+    """Model-callable tools receive the current durable conversation identity."""
+    from gateway.session_context import get_session_env
+
+    sid = "ui-session"
+    session_key = "stored-session"
+    agent = types.SimpleNamespace(session_id=agent_session_id)
+    server._sessions[sid] = {
+        "agent": agent,
+        "session_key": session_key,
+        "source": "desktop",
+    }
+
+    tokens = server._set_session_context(
+        session_key,
+        ui_session_id=sid,
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_KEY") == session_key
+        assert get_session_env("HERMES_SESSION_ID") == expected_session_id
+        assert get_session_env("HERMES_UI_SESSION_ID") == sid
+    finally:
+        server._clear_session_context(tokens)
+        server._sessions.pop(sid, None)
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -794,7 +826,7 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
 
     monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding", "figma"])
 
-    assert server._load_enabled_toolsets() == ["coding", "figma", "project"]
+    assert server._load_enabled_toolsets() == ["coding", "figma", "project", "work"]
 
 
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
@@ -816,10 +848,11 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
+    # Sorted: ["kanban", "memory", "project", "work"]. `kanban` is auto-recovered by
     # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
-    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    # universe); `project` and `work` are GUI-only, folded in by
+    # _load_enabled_toolsets.
+    assert server._load_enabled_toolsets() == ["kanban", "memory", "project", "work"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -840,7 +873,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    assert server._load_enabled_toolsets() == ["kanban", "memory", "project", "work"]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -7845,6 +7878,60 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_returns_owned_work_run_to_parent_agent(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            turns.append(prompt)
+            return {"final_response": "reported", "messages": []}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert callable(self._target)
+            self._target()
+
+    sess = _session(agent=_Agent(), session_key="conversation-parent")
+    monkeypatch.setattr(server, "_sessions", {"sid_work": sess})
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    run_id = "run_" + "d" * 32
+    event = {
+        "type": "work_run",
+        "run_id": run_id,
+        "status": "completed",
+        "session_id": "conversation-parent",
+        "session_key": "conversation-parent",
+        "origin_ui_session_id": "sid_work",
+        "output": "verified terminal result",
+        "error": "",
+    }
+    isolated_queue.put(event)
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_work", sess)
+
+        assert len(turns) == 1
+        assert f"[WORK RUN COMPLETED — {run_id}]" in turns[0]
+        assert "--- DURABLE WORK RESULT ---\nverified terminal result" in turns[0]
+        assert isolated_queue.empty()
+    finally:
+        process_registry._completion_consumed.discard((run_id, "work_run"))
 
 
 def test_notification_poller_defers_orphaned_work_run(monkeypatch):

@@ -248,6 +248,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "work": {
+        "description": (
+            "Delegate, inspect, and stop durable work owned by the active "
+            "conversation; enabled by the Desktop gateway"
+        ),
+        "tools": ["work_start", "work_status", "work_stop"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
