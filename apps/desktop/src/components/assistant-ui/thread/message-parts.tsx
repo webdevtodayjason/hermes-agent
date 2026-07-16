@@ -6,9 +6,11 @@ import {
 } from '@assistant-ui/react'
 import { type ComponentProps, type FC, type ReactNode, useEffect, useRef, useState } from 'react'
 
+import { WORK_START_TOOL_NAME } from '@/app/workhorse/workhorse-contract'
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool/fallback'
+import { WorkRunTool } from '@/components/assistant-ui/tool/work-run'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { DisclosureRow } from '@/components/chat/disclosure-row'
@@ -35,6 +37,10 @@ const ChainToolFallback: FC<ToolCallMessagePartProps> = props => {
 
   if (props.toolName === 'image_generate') {
     return <ImageGenerateTool {...props} />
+  }
+
+  if (props.toolName === WORK_START_TOOL_NAME) {
+    return <WorkRunTool {...props} />
   }
 
   if (props.toolName === 'clarify') {

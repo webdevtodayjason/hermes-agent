@@ -43,3 +43,8 @@ export interface WorkhorseClient {
    *  poll status as a degraded fallback but must still emit terminal events. */
   watch(runId: string, onEvent: (event: WorkhorseEvent) => void): () => void
 }
+
+/** Model-callable delegation tool whose tool-call/result part the inline
+ *  run chip renders. PENDING hermes-sol confirmation of the registered
+ *  backend tool name; the chip dispatch keys on this single constant. */
+export const WORK_START_TOOL_NAME = 'work_start'
