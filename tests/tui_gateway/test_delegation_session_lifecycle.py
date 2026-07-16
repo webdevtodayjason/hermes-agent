@@ -68,6 +68,19 @@ class TestSessionOwnsNotificationEvent:
             assert _session_owns_notification_event("tabX", self._session("child_key"), evt) is True
 
 
+def test_work_run_payload_requires_positive_ownership_and_run_id_dedup():
+    from tui_gateway.server import (
+        _notification_event_dedup_key,
+        _notification_event_requires_positive_ownership,
+    )
+
+    first = {"type": "work_run", "run_id": "run_" + "a" * 32}
+    second = {"type": "work_run", "run_id": "run_" + "b" * 32}
+
+    assert _notification_event_requires_positive_ownership(first) is True
+    assert _notification_event_dedup_key(first) != _notification_event_dedup_key(second)
+
+
 class TestInterruptForSession:
     def _seed_record(self, delegation_id, session_key="", origin_ui_session_id="", status="running"):
         fn = MagicMock()

@@ -1725,6 +1725,8 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
         captured.update(kwargs)
         return types.SimpleNamespace(model=kwargs.get("model"))
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     monkeypatch.delenv("HERMES_MODEL", raising=False)
     monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
     monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
@@ -2326,6 +2328,8 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
@@ -2366,6 +2370,8 @@ def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
 
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
@@ -7839,6 +7845,41 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_defers_orphaned_work_run(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            turns.append(prompt)
+            return {"final_response": "unexpected", "messages": []}
+
+    sess = _session(agent=_Agent(), session_key="current-conversation")
+    monkeypatch.setattr(server, "_sessions", {"sid_work": sess})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    event = {
+        "type": "work_run",
+        "run_id": "run_" + "c" * 32,
+        "status": "completed",
+        "session_key": "missing-parent",
+        "origin_ui_session_id": "missing-tab",
+        "output": "private result",
+    }
+    isolated_queue.put(event)
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, "sid_work", sess)
+
+    assert turns == []
+    assert isolated_queue.get_nowait() == event
 
 
 def test_notification_poller_skips_consumed(monkeypatch):

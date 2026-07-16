@@ -1189,6 +1189,26 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+def test_format_work_run_completion_for_parent_agent():
+    run_id = "run_" + "e" * 32
+    result = format_process_notification(
+        {
+            "type": "work_run",
+            "run_id": run_id,
+            "status": "completed",
+            "session_id": "conversation-parent",
+            "output": "verified result",
+            "error": "",
+        }
+    )
+
+    assert result is not None
+    assert f"[WORK RUN COMPLETED — {run_id}]" in result
+    assert "Status: completed" in result
+    assert "--- DURABLE WORK RESULT ---\nverified result" in result
+    assert "Return the result to the user in this conversation" in result
+
+
 def test_format_completion_event():
     evt = {
         "type": "completion",

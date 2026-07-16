@@ -2146,6 +2146,31 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_work_run(evt: dict) -> str:
+    run_id = str(evt.get("run_id") or "unknown")
+    status = str(evt.get("status") or "failed")
+    output = str(evt.get("output") or "")
+    error = str(evt.get("error") or "")
+    lines = [
+        f"[WORK RUN {status.upper()} — {run_id}]",
+        "Durable background work commissioned by this conversation has reached a terminal state.",
+        f"Status: {status}",
+    ]
+    if status == "completed":
+        lines.extend(["--- DURABLE WORK RESULT ---", output or "(no output)"])
+        lines.append(
+            "Return the result to the user in this conversation, preserving any caveats."
+        )
+    else:
+        lines.extend(["--- TERMINAL DETAIL ---", error or "No error detail was provided."])
+        if output:
+            lines.extend(["--- PARTIAL OUTPUT ---", output])
+        lines.append(
+            "Tell the user the work did not complete successfully; do not claim success."
+        )
+    return "\n".join(lines)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2176,6 +2201,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if evt_type == "work_run":
+        return _format_work_run(evt)
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

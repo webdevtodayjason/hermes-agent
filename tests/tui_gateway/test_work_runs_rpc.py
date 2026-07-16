@@ -277,6 +277,27 @@ def test_work_runs_uses_one_runtime_owner_for_all_service_calls():
     assert len(service.owner_threads) == 1
 
 
+def test_work_start_preserves_parent_return_address():
+    runtime = RunServiceRuntime(startup_timeout=1.0)
+    service = _FakeRunService()
+    work = WorkRuns(service=service, runtime=runtime, model="test/model")
+    try:
+        work.start(
+            session_id="conversation-parent",
+            gateway_session_key="durable-parent",
+            origin_ui_session_id="live-tab",
+            user_input="do the work",
+            history=[],
+        )
+    finally:
+        runtime.shutdown(timeout=1.0)
+
+    start_kwargs = next(call[1] for call in service.calls if call[0] == "start")
+    assert start_kwargs["session_id"] == "conversation-parent"
+    assert start_kwargs["gateway_session_key"] == "durable-parent"
+    assert start_kwargs["route"] == {"origin_ui_session_id": "live-tab"}
+
+
 def test_work_start_leaves_approval_key_to_canonical_unique_run_id():
     runtime = RunServiceRuntime(startup_timeout=1.0)
     service = _FakeRunService()
@@ -316,6 +337,60 @@ def test_work_runs_hides_mismatch_and_nonexistent_behind_one_typed_error(operati
             )
     finally:
         runtime.shutdown(timeout=1.0)
+
+
+def test_tui_hooks_publish_terminal_work_event_to_parent_queue(tmp_path):
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    hooks = work_runs_module._TUIRunExecutionHooks(tmp_path, lambda **_kwargs: None)
+    status = {
+        "object": "hermes.run",
+        "run_id": "run_" + "d" * 32,
+        "status": "completed",
+        "session_id": "conversation-parent",
+        "output": "verified result",
+        "last_event": "run.completed",
+    }
+
+    hooks.publish_terminal_event(
+        status,
+        gateway_session_key="durable-parent",
+        route={"origin_ui_session_id": "live-tab"},
+    )
+
+    assert process_registry.completion_queue.get_nowait() == {
+        "type": "work_run",
+        "run_id": "run_" + "d" * 32,
+        "status": "completed",
+        "session_id": "conversation-parent",
+        "session_key": "durable-parent",
+        "origin_ui_session_id": "live-tab",
+        "output": "verified result",
+        "error": "",
+    }
+
+
+def test_worker_session_context_is_marked_non_recursive(tmp_path, monkeypatch):
+    from gateway import session_context
+    from hermes_constants import reset_hermes_home_override
+
+    observed = {}
+
+    def fake_set_session_vars(**kwargs):
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setattr(session_context, "set_session_vars", fake_set_session_vars)
+    hooks = work_runs_module._TUIRunExecutionHooks(tmp_path, lambda **_kwargs: None)
+    session_tokens, home_token = hooks.bind_session("run-session-key")
+    reset_hermes_home_override(home_token)
+
+    assert session_tokens == []
+    assert observed["source"] == "work_run"
+    assert observed["session_key"] == "run-session-key"
+    assert observed["session_id"] == "run-session-key"
 
 
 class _CompletedAgent:

@@ -8664,6 +8664,11 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+def _notification_event_requires_positive_ownership(evt: dict) -> bool:
+    """Whether an event carries conversation payload that must never be adopted."""
+    return evt.get("type") in {"async_delegation", "work_run"}
+
+
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session.
 
@@ -8821,6 +8826,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "work_run":
+        return (evt.get("run_id", ""), evt_type)
     return (evt_sid, evt_type)
 
 
@@ -8868,7 +8875,9 @@ def _notification_poller_loop(
         # a wrong-chat injection is unrecoverable. Non-delegation events
         # (background process completions etc.) keep the historical
         # adopt-orphans behavior.
-        if evt.get("type") == "async_delegation" and not _session_owns_notification_event(
+        if _notification_event_requires_positive_ownership(
+            evt
+        ) and not _session_owns_notification_event(
             sid, session, evt
         ):
             logger.warning(
@@ -8951,7 +8960,9 @@ def _notification_poller_loop(
         # payload is never adopted by a foreign session — defer it (a later
         # resume of the owner's lineage can still claim it) rather than
         # injecting another chat's conversation here (#55578).
-        if evt.get("type") == "async_delegation" and not _session_owns_notification_event(
+        if _notification_event_requires_positive_ownership(
+            evt
+        ) and not _session_owns_notification_event(
             sid, session, evt
         ):
             deferred.append(evt)

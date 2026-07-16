@@ -56,6 +56,7 @@ class FakeHooks:
         self.unregistered = []
         self.activated = 0
         self.tracked = []
+        self.terminal_events = []
         self.approval_key = ContextVar("fake_approval_key", default=None)
 
     def create_agent(self, **kwargs):
@@ -96,6 +97,9 @@ class FakeHooks:
 
     def track_task(self, task):
         self.tracked.append(task)
+
+    def publish_terminal_event(self, status, **metadata):
+        self.terminal_events.append((status, metadata))
 
 
 async def _wait_terminal(service, run_id):
@@ -177,6 +181,15 @@ async def test_start_to_completed_owns_agent_task_events_and_cleanup():
     assert hooks.cleared == [[hooks.bound[0][1]]]
     assert [key for key, _ in hooks.registered] == ["approval-a"]
     assert hooks.unregistered.count("approval-a") >= 1
+    assert hooks.terminal_events == [
+        (
+            status,
+            {
+                "gateway_session_key": "memory-a",
+                "route": {"model": "test-model"},
+            },
+        )
+    ]
     queue = service.stream_for(run_id)
     assert (await queue.get())["event"] == "run.completed"
     assert await queue.get() is None
@@ -370,6 +383,15 @@ async def test_late_callbacks_cannot_regress_or_displace_terminal_delivery(
     run_id = _start(service)
     terminal_status = await _wait_terminal(service, run_id)
     await hooks.tracked[0]
+    assert hooks.terminal_events == [
+        (
+            terminal_status,
+            {
+                "gateway_session_key": "memory-a",
+                "route": {"model": "test-model"},
+            },
+        )
+    ]
     queue = service.stream_for(run_id)
     assert queue is not None
     terminal_event = service._terminal_replays[run_id][0]
@@ -712,6 +734,15 @@ async def test_cooperative_stop_interrupts_once_and_finishes_cancelled():
 
     assert agent.interrupt_calls == ["Stop requested via API"]
     assert status["status"] == "cancelled"
+    assert hooks.terminal_events == [
+        (
+            status,
+            {
+                "gateway_session_key": "memory-a",
+                "route": {"model": "test-model"},
+            },
+        )
+    ]
     assert service.registry.agent_for(run_id) is None
     assert service.registry.task_for(run_id) is None
 

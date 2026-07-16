@@ -869,7 +869,12 @@ class RunService:
             try:
                 self.registry.set_status(run_id, "running")
                 if self.registry.is_stopping(run_id):
-                    self._cancel(run_id, queue)
+                    self._cancel(
+                        run_id,
+                        queue,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
                     return
 
                 agent = self.hooks.create_agent(
@@ -881,7 +886,12 @@ class RunService:
                     route=route,
                 )
                 if not self.registry.register_agent(run_id, agent):
-                    self._cancel(run_id, queue)
+                    self._cancel(
+                        run_id,
+                        queue,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
                     return
 
                 def approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -958,12 +968,22 @@ class RunService:
 
                 result, usage = await loop.run_in_executor(None, run_sync)
                 if self.registry.is_stopping(run_id):
-                    self._cancel(run_id, queue)
+                    self._cancel(
+                        run_id,
+                        queue,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
                 elif isinstance(result, dict) and result.get("failed"):
                     error = self._safe_redact_error(
                         result.get("error") or "agent run failed"
                     )
                     self._finish_failed(run_id, queue, error)
+                    self._publish_terminal_event(
+                        run_id,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
                 else:
                     output = (
                         result.get("final_response", "")
@@ -985,13 +1005,28 @@ class RunService:
                         last_event="run.completed",
                     )
                     self._put_event_if_active(run_id, queue, event)
+                    self._publish_terminal_event(
+                        run_id,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                    )
             except asyncio.CancelledError:
-                self._cancel(run_id, queue)
+                self._cancel(
+                    run_id,
+                    queue,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                )
                 raise
             except Exception as exc:
                 logger.exception("run %s failed", run_id)
                 self._finish_failed(
                     run_id, queue, self._safe_redact_error(exc)
+                )
+                self._publish_terminal_event(
+                    run_id,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
                 )
             finally:
                 try:
@@ -1010,6 +1045,28 @@ class RunService:
         self.registry.register_task(run_id, task)
         self.hooks.track_task(task)
         return run_id
+
+    def _publish_terminal_event(
+        self,
+        run_id: str,
+        *,
+        gateway_session_key: Optional[str],
+        route: Optional[Dict[str, Any]],
+    ) -> None:
+        callback = getattr(self.hooks, "publish_terminal_event", None)
+        if not callable(callback):
+            return
+        status = self.registry.get(run_id)
+        if status is None or status.get("status") not in TERMINAL_RUN_STATUSES:
+            return
+        try:
+            callback(
+                status,
+                gateway_session_key=gateway_session_key,
+                route=route,
+            )
+        except Exception:
+            logger.exception("run %s terminal notification callback failed", run_id)
 
     @staticmethod
     def _approval_choices(event: Dict[str, Any]) -> List[str]:
@@ -1031,6 +1088,9 @@ class RunService:
         self,
         run_id: str,
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+        *,
+        gateway_session_key: Optional[str] = None,
+        route: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.registry.set_status(
             run_id, "cancelled", last_event="run.cancelled"
@@ -1043,6 +1103,11 @@ class RunService:
                 "run_id": run_id,
                 "timestamp": self._clock(),
             },
+        )
+        self._publish_terminal_event(
+            run_id,
+            gateway_session_key=gateway_session_key,
+            route=route,
         )
 
     def _finish_failed(

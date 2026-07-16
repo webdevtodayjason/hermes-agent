@@ -47,14 +47,25 @@ class WorkRuns:
     def _call(self, coroutine):
         return self.runtime.submit(coroutine).result(timeout=self.timeout)
 
-    def start(self, *, session_id: str, user_input: str, history: list[dict]) -> dict:
+    def start(
+        self,
+        *,
+        session_id: str,
+        user_input: str,
+        history: list[dict],
+        gateway_session_key: str | None = None,
+        origin_ui_session_id: str = "",
+    ) -> dict:
         async def invoke() -> dict:
             run_id = self.service.start(
                 user_message=user_input,
                 conversation_history=history,
                 session_id=session_id,
                 model=self.model,
-                gateway_session_key=session_id,
+                gateway_session_key=gateway_session_key or session_id,
+                route={"origin_ui_session_id": origin_ui_session_id}
+                if origin_ui_session_id
+                else None,
             )
             status = self.service.status(run_id, session_id)
             if status is None:
@@ -142,7 +153,7 @@ class _TUIRunExecutionHooks:
         try:
             session_tokens = set_session_vars(
                 platform="tui",
-                source="tui_gateway",
+                source="work_run",
                 session_key=session_key,
                 session_id=session_key,
                 async_delivery=True,
@@ -164,6 +175,31 @@ class _TUIRunExecutionHooks:
             clear_session_vars(session_tokens)
         finally:
             reset_hermes_home_override(home_token)
+
+    @staticmethod
+    def publish_terminal_event(
+        status: dict,
+        *,
+        gateway_session_key: str | None,
+        route: dict | None,
+    ) -> None:
+        from tools.process_registry import process_registry
+
+        route = route or {}
+        process_registry.completion_queue.put(
+            {
+                "type": "work_run",
+                "run_id": str(status.get("run_id") or ""),
+                "status": str(status.get("status") or ""),
+                "session_id": str(status.get("session_id") or ""),
+                "session_key": str(gateway_session_key or ""),
+                "origin_ui_session_id": str(
+                    route.get("origin_ui_session_id") or ""
+                ),
+                "output": str(status.get("output") or ""),
+                "error": str(status.get("error") or ""),
+            }
+        )
 
     @staticmethod
     def activate_admitted_request() -> None:
