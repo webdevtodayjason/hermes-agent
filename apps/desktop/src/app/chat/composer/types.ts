@@ -36,6 +36,7 @@ export interface ChatBarProps {
   disabled: boolean
   focusKey?: string | null
   maxRecordingSeconds?: number
+  realtimeVoiceFactory?: import('./hooks/use-realtime-conversation').RealtimeVoiceFactory
   state: ChatBarState
   gateway?: HermesGateway | null
   queueSessionKey?: string | null

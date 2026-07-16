@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { ConversationStatus } from './use-voice-conversation'
-
 /**
  * Composer-side adapter for the full-duplex Realtime voice transport.
  *
@@ -18,6 +16,10 @@ import type { ConversationStatus } from './use-voice-conversation'
  *   Realtime is unavailable or fails, fail closed with an actionable
  *   error so the North Star failure is visible, not masked.
  */
+
+/** The composer's conversation-state vocabulary (previously owned by the
+ *  retired serialized loop). */
+export type ConversationStatus = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
 
 export type RealtimeVoiceStatus =
   | 'idle'

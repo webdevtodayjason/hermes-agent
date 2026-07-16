@@ -2,8 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
-import { triggerHaptic } from '@/lib/haptics'
-import { resetBrowseState } from '@/store/composer-input-history'
 import { notifyError } from '@/store/notifications'
 import { $messages } from '@/store/session'
 import { $autoSpeakReplies, setAutoSpeakReplies } from '@/store/voice-prefs'
@@ -12,36 +10,33 @@ import { onComposerVoiceToggleRequest } from '../focus'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
-import { useVoiceConversation } from './use-voice-conversation'
+import { type RealtimeVoiceFactory, useRealtimeConversation } from './use-realtime-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
 interface UseComposerVoiceArgs {
-  busy: boolean
-  clearDraft: () => void
   disabled: boolean
   focusInput: () => void
   insertText: (text: string) => void
   maxRecordingSeconds: number
-  onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
+  realtimeVoiceFactory?: RealtimeVoiceFactory
   sessionId: string | null | undefined
 }
 
 /**
- * The composer's voice engine: push-to-talk dictation (transcript → draft), the
- * full voice-conversation loop, and auto-speak of replies. Self-contained — it
- * consumes the draft/submit primitives passed in but nothing depends back on it,
- * so it lifts cleanly out of ChatBar.
+ * The composer's voice engine: push-to-talk dictation (transcript → draft),
+ * the full-duplex Realtime voice conversation, and auto-speak of replies.
+ * The serialized STT→submit→TTS conversation loop is retired: Voice
+ * Conversation now runs on the Realtime transport and fails closed when it
+ * is unavailable rather than silently degrading (COLLAB-LOG 05:12Z rule).
  */
 export function useComposerVoice({
-  busy,
-  clearDraft,
   disabled,
   focusInput,
   insertText,
   maxRecordingSeconds,
-  onSubmit,
   onTranscribeAudio,
+  realtimeVoiceFactory,
   sessionId
 }: UseComposerVoiceArgs) {
   const { t } = useI18n()
@@ -85,30 +80,24 @@ export function useComposerVoice({
     }
   }
 
-  const submitVoiceTurn = async (text: string) => {
-    if (busy) {
-      return
-    }
+  const onVoiceFatalError = useCallback(
+    (error: unknown) => {
+      setVoiceConversationActive(false)
+      notifyError(error, t.assistant.thread.readAloudFailed)
+    },
+    [t]
+  )
 
-    triggerHaptic('submit')
-    resetBrowseState(sessionId)
-    clearDraft()
-    await onSubmit(text)
-  }
-
-  const conversation = useVoiceConversation({
-    busy,
-    consumePendingResponse,
+  const conversation = useRealtimeConversation({
+    createClient: realtimeVoiceFactory,
     enabled: voiceConversationActive,
-    onFatalError: () => setVoiceConversationActive(false),
-    onSubmit: submitVoiceTurn,
-    onTranscribeAudio,
-    pendingResponse
+    onFatalError: onVoiceFatalError,
+    sessionId
   })
 
   // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting
-  // with STT unconfigured lets the conversation surface its own "configure
-  // speech-to-text" notice rather than silently no-opping.
+  // without a configured Realtime factory fails closed with an actionable
+  // notice rather than silently no-opping or falling back to the old loop.
   const toggleVoiceConversation = useCallback(() => {
     if (disabled) {
       return

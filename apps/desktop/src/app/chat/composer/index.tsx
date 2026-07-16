@@ -66,6 +66,7 @@ export function ChatBar({
   focusKey,
   gateway,
   maxRecordingSeconds = 120,
+  realtimeVoiceFactory,
   queueSessionKey,
   sessionId,
   state,
@@ -655,14 +656,12 @@ export function ChatBar({
     voiceConversationActive,
     voiceStatus
   } = useComposerVoice({
-    busy,
-    clearDraft,
     disabled,
     focusInput,
     insertText,
     maxRecordingSeconds,
-    onSubmit,
     onTranscribeAudio,
+    realtimeVoiceFactory,
     sessionId
   })
 

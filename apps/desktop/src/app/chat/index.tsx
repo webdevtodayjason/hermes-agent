@@ -82,6 +82,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onAddUrl: (url: string) => void
   onBranchInNewChat: (messageId: string) => void
   maxVoiceRecordingSeconds?: number
+  realtimeVoiceFactory?: import('./composer/hooks/use-realtime-conversation').RealtimeVoiceFactory
   onAttachImageBlob: (blob: Blob) => Promise<boolean | void> | boolean | void
   onAttachDroppedItems: (candidates: DroppedFile[]) => Promise<boolean | void> | boolean | void
   onPasteClipboardImage: (opts?: { silent?: boolean }) => Promise<boolean> | void
@@ -276,6 +277,7 @@ export function ChatView({
   onAttachDroppedItems,
   onBranchInNewChat,
   maxVoiceRecordingSeconds,
+  realtimeVoiceFactory,
   onPasteClipboardImage,
   onPickFiles,
   onPickFolders,
@@ -544,6 +546,7 @@ export function ChatView({
               onSubmit={onSubmit}
               onTranscribeAudio={onTranscribeAudio}
               queueSessionKey={selectedSessionId}
+              realtimeVoiceFactory={realtimeVoiceFactory}
               sessionId={activeSessionId}
               state={chatBarState}
             />

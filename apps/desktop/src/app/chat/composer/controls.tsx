@@ -8,7 +8,7 @@ import { AudioLines, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2,
 import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
 
-import type { ConversationStatus } from './hooks/use-voice-conversation'
+import type { ConversationStatus } from './hooks/use-realtime-conversation'
 import { ModelPill } from './model-pill'
 import type { ChatBarState, VoiceStatus } from './types'
 
