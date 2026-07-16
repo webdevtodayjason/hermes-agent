@@ -12,6 +12,7 @@ afterEach(cleanup)
 
 function makeFactory() {
   let onStatus: ((status: RealtimeVoiceStatus) => void) | null = null
+  let onClientFatalError: ((error: unknown) => void) | null = null
 
   const client: RealtimeVoiceClientLike = {
     start: vi.fn(async () => undefined),
@@ -22,11 +23,19 @@ function makeFactory() {
 
   const factory: RealtimeVoiceFactory = vi.fn(options => {
     onStatus = options.onStatus
+    onClientFatalError = (
+      options as typeof options & { onFatalError?: (error: unknown) => void }
+    ).onFatalError ?? null
 
     return client
   })
 
-  return { client, factory, emit: (status: RealtimeVoiceStatus) => onStatus?.(status) }
+  return {
+    client,
+    factory,
+    emit: (status: RealtimeVoiceStatus) => onStatus?.(status),
+    fail: (error: unknown) => onClientFatalError?.(error)
+  }
 }
 
 describe('useRealtimeConversation', () => {
@@ -130,6 +139,23 @@ describe('useRealtimeConversation', () => {
     expect(result.current.status).toBe('idle')
 
     act(() => emit('error'))
+    expect(result.current.status).toBe('idle')
+  })
+
+  it('surfaces terminal transport failures and ends the microphone session', async () => {
+    const { client, factory, fail } = makeFactory()
+    const onFatalError = vi.fn()
+    const error = new Error('Transcript could not be saved')
+
+    const { result } = renderHook(() =>
+      useRealtimeConversation({ createClient: factory, enabled: true, onFatalError, sessionId: 's1' })
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalled())
+    act(() => fail(error))
+
+    await waitFor(() => expect(onFatalError).toHaveBeenCalledWith(error))
+    expect(client.end).toHaveBeenCalledTimes(1)
     expect(result.current.status).toBe('idle')
   })
 })

@@ -3803,7 +3803,9 @@ class SessionDB:
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
-    ) -> int:
+        deduplicate_platform_message_id: bool = False,
+        return_inserted: bool = False,
+    ) -> int | tuple[int, bool]:
         """
         Append a message to a session. Returns the message row ID.
 
@@ -3815,6 +3817,11 @@ class SessionDB:
         independent of the SQLite autoincrement primary key and is used by
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
+
+        When ``deduplicate_platform_message_id`` is true, an existing row with
+        the same non-null ``(session_id, platform_message_id)`` wins atomically
+        inside the write transaction. ``return_inserted`` adds a boolean that
+        distinguishes the existing-row path without changing legacy callers.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -3850,6 +3857,17 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            if deduplicate_platform_message_id and platform_message_id:
+                existing = conn.execute(
+                    """SELECT id FROM messages
+                       WHERE session_id = ? AND platform_message_id = ?
+                       LIMIT 1""",
+                    (session_id, platform_message_id),
+                ).fetchone()
+                if existing is not None:
+                    existing_id = int(existing[0])
+                    return (existing_id, False) if return_inserted else existing_id
+
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -3891,7 +3909,7 @@ class SessionDB:
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
-            return msg_id
+            return (msg_id, True) if return_inserted else msg_id
 
         return self._execute_write(_do)
 

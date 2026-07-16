@@ -362,6 +362,36 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (isActiveEvent) {
           setPetActivity({ reasoning: true })
         }
+      } else if (event.type === 'voice.transcript.final') {
+        if (!sessionId) {
+          return
+        }
+
+        const messageId = typeof payload?.message_id === 'string' ? payload.message_id : ''
+        const role = payload?.role === 'user' || payload?.role === 'assistant' ? payload.role : null
+        const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
+
+        if (!messageId || !role || !text) {
+          return
+        }
+
+        updateSessionState(sessionId, state => {
+          if (state.messages.some(message => message.id === messageId)) {
+            return state
+          }
+
+          return {
+            ...state,
+            messages: [
+              ...state.messages,
+              {
+                id: messageId,
+                role,
+                parts: [textPart(text)]
+              }
+            ]
+          }
+        })
       } else if (event.type === 'message.complete') {
         if (!sessionId) {
           return

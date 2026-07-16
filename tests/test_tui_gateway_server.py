@@ -17,6 +17,472 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+def test_voice_session_create_uses_live_session_and_ensures_durable_row(monkeypatch):
+    sid = "voice-ui-session"
+    session = {"session_key": "voice-stored-session"}
+    ensured = []
+    minted = []
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda value: ensured.append(value))
+    monkeypatch.setattr(
+        server,
+        "mint_realtime_session",
+        lambda session_id, profile=None: minted.append((session_id, profile))
+        or {
+            "client_secret": "ek_ephemeral",
+            "expires_at": 1_800_000_000,
+            "model": "gpt-realtime-2.1",
+            "provider_session_id": "sess-provider",
+            "session_id": session_id,
+        },
+        raising=False,
+    )
+
+    try:
+        response = server._methods["voice.session.create"]("r1", {"session_id": sid})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert ensured == [session]
+    assert minted == [("voice-stored-session", "default")]
+    assert response["result"] == {
+        "client_secret": "ek_ephemeral",
+        "expires_at": 1_800_000_000,
+        "model": "gpt-realtime-2.1",
+        "owner_session_id": "voice-ui-session",
+        "provider_session_id": "sess-provider",
+        "session_id": "voice-stored-session",
+    }
+
+
+def test_voice_transcript_append_persists_emits_and_deduplicates(monkeypatch):
+    sid = "voice-ui-session"
+    session = {
+        "session_key": "voice-stored-session",
+        "history": [],
+        "history_lock": threading.RLock(),
+        "history_version": 0,
+    }
+    appended = []
+    emitted = []
+
+    class FakeDB:
+        def get_messages(self, session_id):
+            assert session_id == "voice-stored-session"
+            return []
+
+        def append_message(self, session_id, role, content, **kwargs):
+            appended.append((session_id, role, content, kwargs))
+            return (42, True)
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload: emitted.append((event_type, session_id, payload)),
+    )
+
+    request = {
+        "session_id": sid,
+        "role": "user",
+        "text": "Please continue",
+        "item_id": "provider-item-1",
+    }
+
+    try:
+        first = server._methods["voice.transcript.append"]("r1", request)
+        second = server._methods["voice.transcript.append"]("r2", request)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert first["result"] == {
+        "message_id": "realtime:provider-item-1:user",
+        "persisted": True,
+        "queued": False,
+    }
+    assert second["result"] == {
+        "message_id": "realtime:provider-item-1:user",
+        "persisted": False,
+        "queued": False,
+    }
+    assert appended == [
+        (
+            "voice-stored-session",
+            "user",
+            "Please continue",
+            {
+                "deduplicate_platform_message_id": True,
+                "platform_message_id": "realtime:provider-item-1:user",
+                "return_inserted": True,
+            },
+        )
+    ]
+    assert session["history"] == [
+        {
+            "role": "user",
+            "content": "Please continue",
+            "message_id": "realtime:provider-item-1:user",
+        }
+    ]
+    assert session["history_version"] == 1
+    assert emitted == [
+        (
+            "voice.transcript.final",
+            sid,
+            {
+                "message_id": "realtime:provider-item-1:user",
+                "role": "user",
+                "text": "Please continue",
+            },
+        )
+    ]
+
+
+def test_voice_transcript_defers_history_and_db_while_turn_is_running(monkeypatch):
+    sid = "voice-running-session"
+    session = {
+        "history": [{"role": "user", "content": "active turn"}],
+        "history_lock": threading.Lock(),
+        "history_version": 7,
+        "running": True,
+        "session_key": "voice-running-stored",
+    }
+    appended = []
+    emitted = []
+
+    class FakeDB:
+        def append_message(self, *args, **kwargs):
+            appended.append((args, kwargs))
+            return (42, True)
+
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    result = server._voice_transcript_append(
+        "req-running",
+        {
+            "session_id": sid,
+            "role": "user",
+            "text": "voice while tools run",
+            "item_id": "voice-running-item",
+        },
+    )
+
+    assert result["result"]["queued"] is True
+    assert session["history"] == [{"role": "user", "content": "active turn"}]
+    assert session["history_version"] == 7
+    assert appended == []
+    assert emitted == [
+        (
+            "voice.transcript.final",
+            sid,
+            {
+                "message_id": "realtime:voice-running-item:user",
+                "role": "user",
+                "text": "voice while tools run",
+            },
+        )
+    ]
+
+    session["running"] = False
+    server._flush_voice_transcripts(session)
+
+    assert session["history"][-1] == {
+        "role": "user",
+        "content": "voice while tools run",
+        "message_id": "realtime:voice-running-item:user",
+    }
+    assert session["history_version"] == 8
+    assert len(appended) == 1
+
+
+def test_voice_transcript_rpc_uses_the_ordered_dispatch_path():
+    assert "voice.transcript.append" not in server._LONG_HANDLERS
+
+
+def test_voice_transcript_duplicate_retries_pending_persistence_when_idle(monkeypatch):
+    sid = "voice-retry-session"
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "session_key": "voice-retry-stored",
+    }
+    appended = []
+
+    class FakeDB:
+        def append_message(self, session_id, role, content, **kwargs):
+            appended.append((session_id, role, content, kwargs))
+            return (42, True)
+
+    request = {
+        "session_id": sid,
+        "role": "assistant",
+        "text": "Durable reply",
+        "item_id": "retry-item",
+    }
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    first = server._voice_transcript_append("req-first", request)
+    assert first["result"]["queued"] is True
+    session["running"] = False
+
+    retry = server._voice_transcript_append("req-retry", request)
+
+    assert retry["result"] == {
+        "message_id": "realtime:retry-item:assistant",
+        "persisted": True,
+        "queued": False,
+    }
+    assert len(appended) == 1
+    assert session["history"][-1]["content"] == "Durable reply"
+
+
+def test_voice_idle_transition_blocks_new_turn_until_transcripts_are_durable(monkeypatch):
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "session_key": "voice-atomic-stored",
+        "_pending_voice_transcripts": [
+            {
+                "message_id": "realtime:atomic:user",
+                "role": "user",
+                "text": "Atomic transcript",
+            }
+        ],
+    }
+    append_started = threading.Event()
+    release_append = threading.Event()
+    new_turn_acquired = threading.Event()
+
+    class BlockingDB:
+        def append_message(self, *args, **kwargs):
+            append_started.set()
+            assert release_append.wait(timeout=1)
+            return (42, True)
+
+    monkeypatch.setattr(server, "_get_db", lambda: BlockingDB())
+
+    transition = threading.Thread(
+        target=server._transition_session_idle,
+        args=(session,),
+    )
+    transition.start()
+    assert append_started.wait(timeout=1)
+
+    def start_new_turn():
+        with session["history_lock"]:
+            session["running"] = True
+            new_turn_acquired.set()
+
+    contender = threading.Thread(target=start_new_turn)
+    contender.start()
+    assert not new_turn_acquired.wait(timeout=0.05)
+
+    release_append.set()
+    transition.join(timeout=1)
+    contender.join(timeout=1)
+
+    assert new_turn_acquired.is_set()
+    assert session["history"] == [
+        {
+            "role": "user",
+            "content": "Atomic transcript",
+            "message_id": "realtime:atomic:user",
+        }
+    ]
+
+
+def test_voice_idle_append_persists_before_a_new_turn_can_claim_session(monkeypatch):
+    sid = "voice-idle-race"
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "session_key": "voice-idle-race-stored",
+    }
+    running_during_append = []
+
+    class FakeDB:
+        def append_message(self, *args, **kwargs):
+            running_during_append.append(session["running"])
+            return (42, True)
+
+    def claim_session_on_emit(*args):
+        with session["history_lock"]:
+            session["running"] = True
+
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_emit", claim_session_on_emit)
+
+    result = server._voice_transcript_append(
+        "req-idle-race",
+        {
+            "session_id": sid,
+            "role": "user",
+            "text": "Persist before next turn",
+            "item_id": "idle-race-item",
+        },
+    )
+
+    assert result["result"]["persisted"] is True
+    assert running_during_append == [False]
+    assert session["running"] is True
+
+
+def test_finalize_session_flushes_pending_voice_transcripts(monkeypatch):
+    appended = []
+
+    class FakeDB:
+        def append_message(self, session_id, role, content, **kwargs):
+            appended.append((session_id, role, content, kwargs))
+            return (42, True)
+
+        def get_session(self, session_id):
+            return None
+
+        def end_session(self, session_id, reason):
+            return None
+
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "session_key": "voice-finalize-stored",
+        "_pending_voice_transcripts": [
+            {
+                "message_id": "realtime:finalize-item:assistant",
+                "role": "assistant",
+                "text": "Do not lose this",
+            }
+        ],
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args: None)
+
+    server._finalize_session(session)
+
+    assert len(appended) == 1
+    assert session["history"] == [
+        {
+            "role": "assistant",
+            "content": "Do not lose this",
+            "message_id": "realtime:finalize-item:assistant",
+        }
+    ]
+    assert session["_pending_voice_transcripts"] == []
+
+
+def test_finalize_session_retries_transient_voice_transcript_failures(monkeypatch):
+    attempts = 0
+
+    class FakeDB:
+        def append_message(self, session_id, role, content, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise RuntimeError("temporary database failure")
+            return (42, True)
+
+        def get_session(self, session_id):
+            return None
+
+        def end_session(self, session_id, reason):
+            return None
+
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "session_key": "voice-finalize-retry-stored",
+        "_pending_voice_transcripts": [
+            {
+                "message_id": "realtime:finalize-retry:user",
+                "role": "user",
+                "text": "Persist after retry",
+            }
+        ],
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args: None)
+
+    server._finalize_session(session)
+
+    assert attempts == 3
+    assert session["history"] == [
+        {
+            "role": "user",
+            "content": "Persist after retry",
+            "message_id": "realtime:finalize-retry:user",
+        }
+    ]
+    assert session["_pending_voice_transcripts"] == []
+
+
+def test_voice_methods_reject_a_foreign_transport(monkeypatch):
+    class FakeTransport:
+        def write(self, obj):
+            return True
+
+        def close(self):
+            return None
+
+    sid = "voice-owned-session"
+    owner = FakeTransport()
+    foreign = FakeTransport()
+    session = {
+        "history": [],
+        "history_lock": threading.Lock(),
+        "session_key": "voice-owned-stored",
+        "transport": owner,
+    }
+    monkeypatch.setitem(server._sessions, sid, session)
+    token = server.bind_transport(foreign)
+    try:
+        transcript = server._voice_transcript_append(
+            "req-foreign-transcript",
+            {
+                "session_id": sid,
+                "role": "user",
+                "text": "wrong owner",
+                "item_id": "foreign",
+            },
+        )
+        mint = server._voice_session_create("req-foreign-mint", {"session_id": sid})
+    finally:
+        server.reset_transport(token)
+
+    assert transcript["error"]["message"] == "session not found"
+    assert mint["error"]["message"] == "session not found"
+
+
+def test_voice_session_create_rejects_non_launch_profile(monkeypatch):
+    sid = "voice-other-profile"
+    session = {
+        "profile_home": "/tmp/other-profile",
+        "session_key": "voice-other-stored",
+    }
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda value: None)
+
+    response = server._voice_session_create("req-other-profile", {"session_id": sid})
+
+    assert response["error"]["message"] == "Realtime voice is unavailable for this profile"
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

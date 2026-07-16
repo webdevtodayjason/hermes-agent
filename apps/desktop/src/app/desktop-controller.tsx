@@ -17,6 +17,12 @@ import { useSkinCommand } from '@/themes/use-skin-command'
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getSessionMessages, type SessionMessage, triggerCronJob } from '../hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
+import {
+  type BackendRealtimeSessionGrant,
+  createBrowserRealtimeVoiceDependencies,
+  createRealtimeTranscriptAppender,
+  createRealtimeVoiceClient
+} from '../lib/realtime-voice-client'
 import { storedSessionIdForNotification } from '../lib/session-ids'
 import { isMessagingSource } from '../lib/session-source'
 import { latestSessionTodos } from '../lib/todos'
@@ -77,6 +83,7 @@ import { isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
+import type { RealtimeVoiceFactory } from './chat/composer/hooks/use-realtime-conversation'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
   ChatPreviewRail,
@@ -482,6 +489,49 @@ export function DesktopController() {
       ) : null,
     [gatewayRef, gatewayState, requestGateway, selectModel]
   )
+
+  const realtimeVoiceFactory = useMemo<RealtimeVoiceFactory>(() => {
+    const dependencies = createBrowserRealtimeVoiceDependencies({
+      mint: sessionId =>
+        requestGateway<BackendRealtimeSessionGrant>('voice.session.create', {
+          session_id: sessionId
+        })
+    })
+
+    return ({ onFatalError, onStatus, sessionId }) => {
+      const appendTranscript = createRealtimeTranscriptAppender({
+        append: ({ itemId, role, text }) =>
+          requestGateway('voice.transcript.append', {
+            item_id: itemId,
+            role,
+            session_id: sessionId,
+            text
+          }),
+        onError: error => {
+          console.error('Realtime transcript persistence failed after retries', error)
+          onFatalError(error)
+        }
+      })
+
+      const persistTranscript = (role: 'assistant' | 'user', text: string, itemId: string) => {
+        void appendTranscript({ itemId, role, text }).catch(error => {
+          console.error('Realtime transcript queue rejected', error)
+        })
+      }
+
+      return createRealtimeVoiceClient({
+        dependencies,
+        onAssistantTranscript: (text, itemId) => {
+          persistTranscript('assistant', text, itemId)
+        },
+        onStatus,
+        onUserTranscript: (text, itemId) => {
+          persistTranscript('user', text, itemId)
+        },
+        sessionId
+      })
+    }
+  }, [requestGateway])
 
   useContextSuggestions({
     activeSessionId,
@@ -1141,6 +1191,7 @@ export function DesktopController() {
       onThreadMessagesChange={handleThreadMessagesChange}
       onToggleSelectedPin={toggleSelectedPin}
       onTranscribeAudio={transcribeVoiceAudio}
+      realtimeVoiceFactory={realtimeVoiceFactory}
     />
     </ChatWorkRunProvider>
   )

@@ -12,6 +12,29 @@ import {
 } from './chat-messages'
 
 describe('toChatMessages', () => {
+  it('uses a persisted platform message id as the stable hydrated identity', () => {
+    const first = toChatMessages([
+      {
+        role: 'user',
+        content: 'voice transcript',
+        message_id: 'realtime:item-1:user',
+        timestamp: 1
+      }
+    ])
+
+    const refreshed = toChatMessages([
+      {
+        role: 'user',
+        content: 'voice transcript',
+        message_id: 'realtime:item-1:user',
+        timestamp: 999
+      }
+    ])
+
+    expect(first[0].id).toBe('realtime:item-1:user')
+    expect(refreshed[0].id).toBe(first[0].id)
+  })
+
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {
     const messages = toChatMessages([
       { role: 'assistant', content: 'Planning.', timestamp: 1 },

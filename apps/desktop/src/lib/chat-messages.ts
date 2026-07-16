@@ -26,6 +26,9 @@ export type GatewayEventPayload = {
   rendered?: string
   status?: string
   message?: string
+  // voice.transcript.final — stable provider-item identity in the owning session
+  message_id?: string
+  role?: 'user' | 'assistant'
   id?: string
   name?: string
   tool_id?: string
@@ -836,7 +839,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
+      id:
+        message.platform_message_id ||
+        message.message_id ||
+        `${message.timestamp || Date.now()}-${index}-${message.role}`,
       role: message.role,
       parts,
       timestamp: message.timestamp

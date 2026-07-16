@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -24,6 +25,11 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.realtime_voice import (
+    RealtimeCredentialUnavailable,
+    RealtimeProviderError,
+    mint_realtime_session,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -226,6 +232,7 @@ _LONG_HANDLERS = frozenset(
         "work.start",
         "work.status",
         "work.stop",
+        "voice.session.create",
         "session.branch",
         "session.compress",
         "session.list",
@@ -567,6 +574,19 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     lock = session.get("history_lock")
     if lock is not None:
         with lock:
+            session["running"] = False
+            if session.get("_pending_voice_transcripts"):
+                for attempt in range(3):
+                    try:
+                        _flush_voice_transcripts_locked(session)
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            logger.exception(
+                                "Failed to persist queued Realtime transcripts during session finalization"
+                            )
+                        else:
+                            time.sleep(0.05)
             history = list(session.get("history", []))
     else:
         history = list(session.get("history", []))
@@ -1272,6 +1292,190 @@ def _work_result(rid, callback):
         return _ok(rid, callback())
     except WorkRunNotFound:
         return _err(rid, -32004, "run not found")
+
+
+def _voice_owned_session(params: dict, rid: str) -> tuple[dict | None, dict | None]:
+    """Resolve a live session owned by the transport handling this RPC."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return None, err
+    assert session is not None
+    owner = session.get("transport")
+    if owner is not None and current_transport() is not owner:
+        return None, _err(rid, 4001, "session not found")
+    return session, None
+
+
+def _flush_voice_transcripts_locked(session: dict) -> dict[str, bool]:
+    """Persist queued voice finals while the caller owns ``history_lock``."""
+    db = _get_db()
+    if db is None:
+        raise RuntimeError("session database unavailable")
+
+    persisted: dict[str, bool] = {}
+    pending = session.setdefault("_pending_voice_transcripts", [])
+    while pending:
+        entry = pending[0]
+        append_result = db.append_message(
+            session["session_key"],
+            entry["role"],
+            entry["text"],
+            platform_message_id=entry["message_id"],
+            deduplicate_platform_message_id=True,
+            return_inserted=True,
+        )
+        if not isinstance(append_result, tuple):
+            raise RuntimeError("session database did not return insert status")
+        _row_id, inserted = append_result
+        if inserted:
+            session.setdefault("history", []).append(
+                {
+                    "role": entry["role"],
+                    "content": entry["text"],
+                    "message_id": entry["message_id"],
+                }
+            )
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        persisted[entry["message_id"]] = bool(inserted)
+        pending.pop(0)
+    return persisted
+
+
+def _flush_voice_transcripts(session: dict) -> dict[str, bool]:
+    """Persist queued voice finals at a safe canonical turn boundary."""
+    with session["history_lock"]:
+        return _flush_voice_transcripts_locked(session)
+
+
+def _transition_session_idle(session: dict) -> dict[str, bool]:
+    """Atomically finish a turn and make queued voice finals durable."""
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        _clear_inflight_turn(session)
+        try:
+            return _flush_voice_transcripts_locked(session)
+        except Exception:
+            logger.exception("Failed to flush queued Realtime transcripts")
+            return {}
+
+
+@method("voice.transcript.append")
+def _voice_transcript_append(rid, params: dict) -> dict:
+    """Queue one finalized Realtime transcript for its owning conversation."""
+    sid = params.get("session_id") or ""
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+
+    role = params.get("role")
+    text = params.get("text")
+    item_id = params.get("item_id")
+    if (
+        role not in {"user", "assistant"}
+        or not isinstance(text, str)
+        or not text.strip()
+        or len(text) > 20_000
+        or not isinstance(item_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", item_id) is None
+    ):
+        return _err(rid, -32602, "invalid voice.transcript.append params")
+
+    text = text.strip()
+    message_id = f"realtime:{item_id}:{role}"
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return _err(rid, 4001, "session has no durable conversation")
+
+    duplicate = False
+    flush_error: Exception | None = None
+    persisted = False
+    with session["history_lock"]:
+        seen = session.setdefault("_voice_transcript_ids", set())
+        if message_id in seen:
+            duplicate = True
+            pending = any(
+                entry.get("message_id") == message_id
+                for entry in session.get("_pending_voice_transcripts", [])
+            )
+        else:
+            seen.add(message_id)
+            session.setdefault("_pending_voice_transcripts", []).append(
+                {"message_id": message_id, "role": role, "text": text}
+            )
+            pending = True
+
+        queued = pending and bool(session.get("running"))
+        if pending and not queued:
+            try:
+                flushed = _flush_voice_transcripts_locked(session)
+                persisted = flushed.get(message_id, False)
+            except Exception as exc:
+                flush_error = exc
+
+    if not duplicate:
+        _emit(
+            "voice.transcript.final",
+            sid,
+            {"message_id": message_id, "role": role, "text": text},
+        )
+
+    if flush_error is not None:
+        return _err(rid, 5000, f"failed to persist transcript: {flush_error}")
+    if duplicate and not pending:
+        return _ok(
+            rid,
+            {"message_id": message_id, "persisted": False, "queued": False},
+        )
+    if queued:
+        return _ok(
+            rid,
+            {"message_id": message_id, "persisted": False, "queued": True},
+        )
+    return _ok(
+        rid,
+        {
+            "message_id": message_id,
+            "persisted": persisted,
+            "queued": False,
+        },
+    )
+
+
+@method("voice.session.create")
+def _voice_session_create(rid, params: dict) -> dict:
+    """Mint Realtime transport credentials for a positively owned live session."""
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+
+    _ensure_session_db_row(session)
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return _err(rid, 4001, "session has no durable conversation")
+
+    if "profile" in params:
+        return _err(rid, -32602, "invalid voice.session.create params")
+    if session.get("profile_home"):
+        return _err(rid, 4012, "Realtime voice is unavailable for this profile")
+
+    try:
+        result = mint_realtime_session(
+            session_key,
+            profile=_current_profile_name(),
+        )
+    except RealtimeCredentialUnavailable as exc:
+        return _err(rid, 4012, str(exc))
+    except RealtimeProviderError:
+        logger.exception("OpenAI Realtime session mint failed")
+        return _err(rid, 5000, "OpenAI Realtime session could not be created")
+
+    return _ok(
+        rid,
+        {**result, "owner_session_id": params.get("session_id")},
+    )
 
 
 @method("work.start")
@@ -5123,6 +5327,10 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}
+        if m.get("message_id"):
+            msg["message_id"] = m.get("message_id")
+        elif m.get("platform_message_id"):
+            msg["platform_message_id"] = m.get("platform_message_id")
         if role == "assistant":
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
@@ -5295,8 +5503,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        with session["history_lock"]:
-            session["running"] = False
+        _transition_session_idle(session)
     return True
 
 
@@ -8277,6 +8484,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    assert session is not None
     # Safety net: if the turn's run thread is already gone but `running` stayed
     # stuck (a crash/desync that skipped the run loop's `finally`), force-clear it
     # so the session can't be permanently bricked at 4009 "session busy" — every
@@ -8294,9 +8502,9 @@ def _(rid, params: dict) -> dict:
         session["queued_prompt"] = None
     if not run_thread_alive:
         with session["history_lock"]:
-            if session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
+            should_finish = bool(session.get("running"))
+        if should_finish:
+            _transition_session_idle(session)
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -8585,6 +8793,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -8650,15 +8859,15 @@ def _(rid, params: dict) -> dict:
                     )
                 },
             )
-            with session["history_lock"]:
-                session["running"] = False
-                _clear_inflight_turn(session)
+            _transition_session_idle(session)
             return
         with session["history_lock"]:
-            if session.get("_turn_cancel_requested") or not session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
-                return
+            should_finish = bool(
+                session.get("_turn_cancel_requested") or not session.get("running")
+            )
+        if should_finish:
+            _transition_session_idle(session)
+            return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -8946,8 +9155,7 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            _transition_session_idle(session)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9008,8 +9216,7 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            _transition_session_idle(session)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9495,10 +9702,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
-            with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                _clear_inflight_turn(session)
+            _transition_session_idle(session)
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
@@ -9529,8 +9733,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     f"{type(_cont_exc).__name__}: {_cont_exc}",
                     file=sys.stderr,
                 )
-                with session["history_lock"]:
-                    session["running"] = False
+                _transition_session_idle(session)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -9569,8 +9772,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+                    _transition_session_idle(session)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

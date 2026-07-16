@@ -368,7 +368,9 @@ export interface SessionMessage {
   codex_reasoning_items?: unknown
   content: unknown
   context?: unknown
+  message_id?: null | string
   name?: string
+  platform_message_id?: null | string
   reasoning?: null | string
   reasoning_content?: null | string
   reasoning_details?: unknown

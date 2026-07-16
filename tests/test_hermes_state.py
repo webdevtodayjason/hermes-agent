@@ -1257,6 +1257,31 @@ class TestMessageStorage:
         # Assistant row had no platform id — must not gain one spuriously.
         assert "message_id" not in assistant_msg
 
+    def test_append_message_can_atomically_deduplicate_platform_id(self, db):
+        db.create_session(session_id="s_voice_once", source="desktop")
+
+        first_id, first_inserted = db.append_message(
+            "s_voice_once",
+            "user",
+            "hello",
+            platform_message_id="realtime:item-1:user",
+            deduplicate_platform_message_id=True,
+            return_inserted=True,
+        )
+        second_id, second_inserted = db.append_message(
+            "s_voice_once",
+            "user",
+            "hello",
+            platform_message_id="realtime:item-1:user",
+            deduplicate_platform_message_id=True,
+            return_inserted=True,
+        )
+
+        assert first_inserted is True
+        assert second_inserted is False
+        assert second_id == first_id
+        assert len(db.get_messages("s_voice_once")) == 1
+
     def test_replace_messages_preserves_platform_message_id(self, db):
         """``rewrite_transcript`` (which goes through replace_messages) must
         keep the platform_message_id round-trip working for /retry, /undo,

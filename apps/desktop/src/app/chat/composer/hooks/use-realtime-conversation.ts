@@ -39,6 +39,7 @@ export interface RealtimeVoiceClientLike {
 
 export interface RealtimeVoiceFactoryOptions {
   sessionId: string
+  onFatalError: (error: unknown) => void
   onStatus: (status: RealtimeVoiceStatus) => void
 }
 
@@ -103,15 +104,7 @@ export function useRealtimeConversation({
 
     let cancelled = false
     let ended = false
-
-    const client = createClient({
-      onStatus: providerStatus => {
-        if (!cancelled) {
-          setStatus(STATUS_MAP[providerStatus] ?? 'idle')
-        }
-      },
-      sessionId
-    })
+    let client: RealtimeVoiceClientLike | null = null
 
     const endOnce = (): Promise<void> => {
       if (ended) {
@@ -120,8 +113,26 @@ export function useRealtimeConversation({
 
       ended = true
 
-      return client.end()
+      return client?.end() ?? Promise.resolve()
     }
+
+    client = createClient({
+      onFatalError: error => {
+        if (!cancelled) {
+          cancelled = true
+          setStatus('idle')
+          clientRef.current = null
+          void endOnce()
+          onFatalErrorRef.current(error)
+        }
+      },
+      onStatus: providerStatus => {
+        if (!cancelled) {
+          setStatus(STATUS_MAP[providerStatus] ?? 'idle')
+        }
+      },
+      sessionId
+    })
 
     clientRef.current = client
     endActiveRef.current = endOnce
