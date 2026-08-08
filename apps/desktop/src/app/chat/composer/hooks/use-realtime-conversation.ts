@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { acquireRealtimeAudio } from '@/store/realtime-audio'
+import {
+  subscribeVoiceIntentProgress,
+  subscribeVoiceIntentTerminal,
+  type VoiceIntentTerminalResult
+} from '@/store/voice-intent-results'
+
 /**
  * Composer-side adapter for the Realtime STT/VAD transport.
  *
@@ -31,10 +38,12 @@ export type RealtimeVoiceStatus =
   | 'error'
 
 export interface RealtimeVoiceClientLike {
+  announceCanonicalProgress?(progress: { correlationId: string; status: 'approval_pending' }): boolean
   start(): Promise<void>
   end(): Promise<void>
   setMuted(muted: boolean): void
   interrupt(): void
+  narrateCanonicalResult?(result: Omit<VoiceIntentTerminalResult, 'sessionId'>): boolean
 }
 
 export interface RealtimeVoiceFactoryOptions {
@@ -98,6 +107,7 @@ export function useRealtimeConversation({
   const [status, setStatus] = useState<ConversationStatus>('idle')
   const [liveTranscript, setLiveTranscript] = useState('')
   const [muted, setMuted] = useState(false)
+  const [progressText, setProgressText] = useState('')
   const [userSpeaking, setUserSpeaking] = useState(false)
   const liveTranscriptItemRef = useRef<string | null>(null)
   const retiredCaptionItemsRef = useRef(new Set<string>())
@@ -154,11 +164,59 @@ export function useRealtimeConversation({
       mutedRef.current = false
       userSpeakingRef.current = false
       setMuted(false)
+      setProgressText('')
       setStatus('idle')
       clearLiveTranscript()
       setUserSpeaking(false)
     }
   }, [clearLiveTranscript, createClient, enabled, onBargeIn, onFatalError, onUserTranscript, sessionId])
+
+  useEffect(() => subscribeVoiceIntentProgress(progress => {
+    const lifecycle = lifecycleRef.current
+
+    if (!lifecycle.enabled || lifecycle.sessionId !== progress.sessionId) {
+      return
+    }
+
+    if (progress.status === 'queued') {
+      setProgressText('Queued…')
+    } else if (progress.status === 'running') {
+      setProgressText('Working…')
+    } else if (progress.status === 'approval_pending') {
+      setProgressText('Needs approval…')
+      clientRef.current?.announceCanonicalProgress?.({
+        correlationId: progress.correlationId,
+        status: 'approval_pending'
+      })
+    } else if (progress.status === 'completed') {
+      setProgressText('Finishing…')
+    } else if (progress.status === 'interrupted') {
+      setProgressText('Work interrupted.')
+    } else {
+      setProgressText('Work failed. Please retry.')
+      onFatalErrorRef.current(new Error(
+        progress.status === 'rejected'
+          ? 'Voice work queue is full. Please retry.'
+          : 'Canonical voice work failed. Please retry.'
+      ))
+    }
+  }), [])
+
+  useEffect(() => subscribeVoiceIntentTerminal(result => {
+    const lifecycle = lifecycleRef.current
+
+    if (!lifecycle.enabled || lifecycle.sessionId !== result.sessionId) {
+      return
+    }
+
+    setProgressText('')
+    clientRef.current?.narrateCanonicalResult?.({
+      correlationId: result.correlationId,
+      deliveryId: result.deliveryId,
+      providerSessionId: result.providerSessionId,
+      text: result.text
+    })
+  }), [])
 
   // Exactly-once end per session: explicit end() and the effect cleanup
   // both reach the same client (Sol's adapter-lifecycle finding). Each
@@ -248,6 +306,12 @@ export function useRealtimeConversation({
     const capturedPlaybackStop = lifecycleRef.current.handler
     const ownsLifecycle = () => lifecycleRef.current.generation === activeGeneration
 
+    // Global audio ownership spans the whole session attempt, connect
+    // included, so generic auto-TTS is silent from the first moment the
+    // provider could speak. Every close path funnels through endOnce, and
+    // release itself is once-guarded (RED-4).
+    const releaseRealtimeAudio = acquireRealtimeAudio()
+
     const stopPlaybackForClose = (playbackAlreadyStopped = false) => {
       if (playbackClosed) {
         return
@@ -277,6 +341,7 @@ export function useRealtimeConversation({
       }
 
       ended = true
+      releaseRealtimeAudio()
 
       try {
         return Promise.resolve(client?.end())
@@ -483,6 +548,7 @@ export function useRealtimeConversation({
     const endActive = endActiveRef.current
     endActiveRef.current = null
     clientRef.current = null
+    setProgressText('')
     setStatus('idle')
     clearLiveTranscript()
     updateUserSpeaking(false)
@@ -507,6 +573,7 @@ export function useRealtimeConversation({
     level: 0,
     liveTranscript,
     muted,
+    progressText,
     status,
     stopTurn,
     toggleMute,

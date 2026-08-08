@@ -10,6 +10,7 @@ import {
   migrateQueuedPrompts,
   promoteQueuedPrompt,
   removeQueuedPrompt,
+  setQueuedPromptInFlight,
   shouldAutoDrain,
   updateQueuedPrompt,
   updateQueuedPromptText
@@ -40,6 +41,68 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('first')
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('second')
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
+  })
+
+  it('coalesces pending voice turns in place without constraining typed prompts', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      source: 'voice',
+      text: 'voice one'
+    })
+
+    expect(first).not.toBeNull()
+
+    const merged = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      source: 'voice',
+      text: 'voice two'
+    })
+
+    expect(merged).toMatchObject({
+      id: first?.id,
+      source: 'voice',
+      text: 'voice one voice two'
+    })
+    expect(enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'typed remains available' })).not.toBeNull()
+
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => [entry.source, entry.text])).toEqual([
+      ['voice', 'voice one voice two'],
+      [undefined, 'typed remains available']
+    ])
+  })
+
+  it('never coalesces new speech into the voice turn already being submitted', () => {
+    const executing = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      source: 'voice',
+      text: 'already executing'
+    })
+
+    expect(executing).not.toBeNull()
+    setQueuedPromptInFlight(executing?.id, true)
+
+    const pending = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      source: 'voice',
+      text: 'new thought'
+    })
+
+    const mergedPending = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      source: 'voice',
+      text: 'continued'
+    })
+
+    expect(mergedPending?.id).toBe(pending?.id)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual([
+      'already executing',
+      'new thought continued'
+    ])
+
+    setQueuedPromptInFlight(executing?.id, false)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual([
+      'already executing new thought continued'
+    ])
   })
 
   it('clones attachments when queueing', () => {

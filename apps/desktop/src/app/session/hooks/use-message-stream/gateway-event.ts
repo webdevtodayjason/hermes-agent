@@ -68,6 +68,18 @@ interface GatewayEventDeps {
   compactedTurnRef: MutableRefObject<Set<string>>
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
+  onVoiceIntentProgress?: (progress: {
+    correlationId: string
+    sessionId: string
+    status: 'queued' | 'running' | 'approval_pending' | 'completed' | 'failed' | 'interrupted' | 'rejected'
+  }) => void
+  onVoiceIntentTerminal?: (result: {
+    correlationId: string
+    deliveryId: string
+    providerSessionId: string
+    sessionId: string
+    text: string
+  }) => void
   appendAssistantDelta: (sessionId: string, delta: string) => void
   appendReasoningDelta: (sessionId: string, delta: string, replace?: boolean) => void
   completeAssistantMessage: (sessionId: string, text: string) => void
@@ -98,6 +110,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
+    onVoiceIntentProgress,
+    onVoiceIntentTerminal,
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
@@ -114,6 +128,98 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+
+      if (event.type === 'voice.intent.progress') {
+        const rawPayload = event.payload
+        const progressPayload = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+          ? rawPayload as Record<string, unknown>
+          : {}
+        const keys = Object.keys(progressPayload)
+        const correlationId = progressPayload.correlation_id
+        const status = progressPayload.status
+        const allowedStatuses = new Set([
+          'queued',
+          'running',
+          'approval_pending',
+          'completed',
+          'failed',
+          'interrupted',
+          'rejected'
+        ])
+
+        if (
+          onVoiceIntentProgress
+          && explicitSid
+          && keys.length === 2
+          && keys.every(key => key === 'correlation_id' || key === 'status')
+          && typeof correlationId === 'string'
+          && /^[A-Za-z0-9._:-]{1,256}$/.test(correlationId)
+          && typeof status === 'string'
+          && allowedStatuses.has(status)
+        ) {
+          onVoiceIntentProgress({
+            correlationId,
+            sessionId: explicitSid,
+            status: status as 'queued' | 'running' | 'approval_pending' | 'completed' | 'failed' | 'interrupted' | 'rejected'
+          })
+        }
+
+        return
+      }
+
+      if (event.type === 'voice.intent.terminal') {
+        const rawPayload = event.payload
+        const allowedKeys = new Set([
+          'correlation_id',
+          'delivery_id',
+          'provider_session_id',
+          'status',
+          'text',
+          'truncated'
+        ])
+
+        const keys = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+          ? Object.keys(rawPayload)
+          : []
+
+        const terminalPayload = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+          ? rawPayload as Record<string, unknown>
+          : {}
+
+        const correlationId = terminalPayload.correlation_id
+        const deliveryId = terminalPayload.delivery_id
+        const providerSessionId = terminalPayload.provider_session_id
+        const status = terminalPayload.status
+        const text = terminalPayload.text
+
+        if (
+          onVoiceIntentTerminal
+          && explicitSid
+          && keys.length >= 5
+          && keys.every(key => allowedKeys.has(key))
+          && typeof correlationId === 'string'
+          && /^[A-Za-z0-9._:-]{1,256}$/.test(correlationId)
+          && typeof deliveryId === 'string'
+          && /^[A-Za-z0-9._:-]{1,256}$/.test(deliveryId)
+          && typeof providerSessionId === 'string'
+          && /^[A-Za-z0-9._:-]{1,256}$/.test(providerSessionId)
+          && status === 'completed'
+          && typeof text === 'string'
+          && text.trim().length > 0
+          && text.length <= 4_000
+          && (terminalPayload.truncated === undefined || typeof terminalPayload.truncated === 'boolean')
+        ) {
+          onVoiceIntentTerminal({
+            correlationId,
+            deliveryId,
+            providerSessionId,
+            sessionId: explicitSid,
+            text
+          })
+        }
+
+        return
+      }
 
       const route = resolveGatewayEventSessionId({
         activeSessionId: activeSessionIdRef.current,
@@ -741,6 +847,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       flushQueuedDeltas,
       lastCwdInfoSessionRef,
       nativeSubagentSessionsRef,
+      onVoiceIntentProgress,
+      onVoiceIntentTerminal,
       queryClient,
       refreshHermesConfig,
       sessionInterrupted,

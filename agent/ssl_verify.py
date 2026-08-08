@@ -45,19 +45,28 @@ def resolve_httpx_verify(
         )
         return False
 
-    effective_ca = (
-        (ca_bundle or "").strip()
-        or os.getenv("HERMES_CA_BUNDLE", "").strip()
-        or os.getenv("SSL_CERT_FILE", "").strip()
-        or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
-        or os.getenv("CURL_CA_BUNDLE", "").strip()
-    )
-    if effective_ca:
-        ca_path = str(Path(effective_ca).expanduser())
+    explicit_ca = (ca_bundle or "").strip()
+    if explicit_ca:
+        ca_path = str(Path(explicit_ca).expanduser())
         if os.path.isfile(ca_path):
             return ssl.create_default_context(cafile=ca_path)
         logger.warning(
-            "CA bundle path does not exist: %s — falling back to default certificates",
-            effective_ca,
+            "CA bundle path does not exist: %s — falling back to environment/default certificates",
+            explicit_ca,
         )
+
+    for env_name in ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        env_ca = os.getenv(env_name, "").strip()
+        if not env_ca:
+            continue
+        ca_path = str(Path(env_ca).expanduser())
+        if os.path.isfile(ca_path):
+            return ssl.create_default_context(cafile=ca_path)
+        logger.warning(
+            "CA bundle path from %s does not exist: %s — removing it before default certificate fallback",
+            env_name,
+            env_ca,
+        )
+        os.environ.pop(env_name, None)
+
     return True

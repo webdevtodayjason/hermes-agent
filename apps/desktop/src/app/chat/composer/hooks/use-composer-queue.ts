@@ -13,6 +13,7 @@ import {
   promoteQueuedPrompt,
   type QueuedPromptEntry,
   removeQueuedPrompt,
+  setQueuedPromptInFlight,
   shouldAutoDrain,
   updateQueuedPrompt
 } from '@/store/composer-queue'
@@ -194,6 +195,7 @@ export function useComposerQueue({
       }
 
       drainingQueueRef.current = true
+      setQueuedPromptInFlight(entry.id, true)
 
       try {
         const accepted = await Promise.resolve(
@@ -210,6 +212,7 @@ export function useComposerQueue({
 
         return true
       } finally {
+        setQueuedPromptInFlight(entry.id, false)
         drainingQueueRef.current = false
       }
     },

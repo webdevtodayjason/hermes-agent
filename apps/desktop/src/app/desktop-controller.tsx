@@ -20,7 +20,11 @@ import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChat
 import {
   type BackendRealtimeSessionGrant,
   createBrowserRealtimeVoiceDependencies,
-  createRealtimeVoiceClient
+  createRealtimeTranscriptAppender,
+  createRealtimeVoiceClient,
+  type RealtimeCanonicalProgress,
+  type RealtimeCanonicalResult,
+  type RealtimeCanonicalResultStage
 } from '../lib/realtime-voice-client'
 import { storedSessionIdForNotification } from '../lib/session-ids'
 import { isMessagingSource } from '../lib/session-source'
@@ -78,6 +82,10 @@ import {
 import { onSessionsChanged } from '../store/session-sync'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
+import {
+  publishVoiceIntentProgress,
+  publishVoiceIntentTerminal
+} from '../store/voice-intent-results'
 import { isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
@@ -497,11 +505,93 @@ export function DesktopController() {
         })
     })
 
-    return ({ onStatus, onUserTranscript, onUserTranscriptDelta, sessionId }) => {
+    return ({ onFatalError, onStatus, onUserTranscript, onUserTranscriptDelta, sessionId }) => {
+      const appendTranscript = createRealtimeTranscriptAppender({
+        append: ({ itemId, role, text }) =>
+          requestGateway('voice.transcript.append', {
+            item_id: itemId,
+            role,
+            session_id: sessionId,
+            text
+          }),
+        onError: error => {
+          console.error('Realtime transcript persistence failed after retries', error)
+          onFatalError(error)
+        }
+      })
+
+      const persistTranscript = (role: 'assistant' | 'user', text: string, itemId: string) => {
+        void appendTranscript({ itemId, role, text }).catch(error => {
+          console.error('Realtime transcript queue rejected', error)
+        })
+      }
+
       return createRealtimeVoiceClient({
         dependencies,
+        onAssistantTranscript: (text, itemId) => persistTranscript('assistant', text, itemId),
+        onCanonicalProgress: (progress: RealtimeCanonicalProgress) =>
+          publishVoiceIntentProgress({ ...progress, sessionId }),
+        onCanonicalResultStage: async (
+          result: RealtimeCanonicalResult,
+          stage: RealtimeCanonicalResultStage
+        ) => {
+          await requestGateway('voice.intent.ack', {
+            call_id: result.correlationId,
+            delivery_id: result.deliveryId,
+            provider_session_id: result.providerSessionId,
+            session_id: sessionId,
+            stage
+          })
+
+          if (stage !== 'narration_failed') {return}
+
+          const pending = await requestGateway('voice.intent.pending', {
+            session_id: sessionId
+          }) as {
+            results?: Array<{
+              correlation_id?: unknown
+              delivery_id?: unknown
+              provider_session_id?: unknown
+              text?: unknown
+            }>
+          }
+
+          return (pending.results ?? []).flatMap(candidate => {
+            if (
+              typeof candidate.correlation_id !== 'string'
+              || typeof candidate.delivery_id !== 'string'
+              || typeof candidate.provider_session_id !== 'string'
+              || typeof candidate.text !== 'string'
+            ) {return []}
+
+            return [{
+              correlationId: candidate.correlation_id,
+              deliveryId: candidate.delivery_id,
+              providerSessionId: candidate.provider_session_id,
+              text: candidate.text
+            }]
+          })
+        },
+        onCanonicalResultStageError: onFatalError,
+        onIntentDispatch: async (intent, callId, itemId) => {
+          const result = await requestGateway('voice.intent.dispatch', {
+            call_id: callId,
+            intent,
+            item_id: itemId,
+            session_id: sessionId
+          }) as { correlation_id?: unknown; status?: unknown }
+
+          if (result.correlation_id !== callId || result.status !== 'queued') {
+            throw new Error('Gateway rejected the Realtime intent dispatch')
+          }
+
+          return { correlationId: callId, status: 'queued' }
+        },
         onStatus,
-        onUserTranscript,
+        onUserTranscript: (text, itemId) => {
+          onUserTranscript(text, itemId)
+          persistTranscript('user', text, itemId)
+        },
         onUserTranscriptDelta,
         sessionId
       })
@@ -610,6 +700,8 @@ export function DesktopController() {
   const { handleGatewayEvent } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,
+    onVoiceIntentProgress: publishVoiceIntentProgress,
+    onVoiceIntentTerminal: publishVoiceIntentTerminal,
     queryClient,
     refreshHermesConfig,
     refreshSessions,

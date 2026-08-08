@@ -14,6 +14,7 @@ import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { type RealtimeVoiceFactory, useRealtimeConversation } from './use-realtime-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
+
 interface UseComposerVoiceArgs {
   disabled: boolean
   focusInput: () => void
@@ -27,8 +28,9 @@ interface UseComposerVoiceArgs {
 
 /**
  * The composer's voice engine: push-to-talk dictation (transcript → draft),
- * Realtime STT/VAD for Spoke, and canonical assistant-reply narration. Every
- * user final is handed to canonical Hermes; the provider never authors replies.
+ * Realtime full-duplex Spoke, and canonical assistant-reply narration for
+ * explicitly dispatched durable work. Casual provider speech never submits a
+ * canonical text-session turn.
  */
 export function useComposerVoice({
   disabled,
@@ -43,6 +45,7 @@ export function useComposerVoice({
   const { t } = useI18n()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const lastSpokenIdRef = useRef<string | null>(null)
+
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
     focusInput,
@@ -84,10 +87,11 @@ export function useComposerVoice({
   const onVoiceFatalError = useCallback(
     (error: unknown) => {
       setVoiceConversationActive(false)
-      notifyError(error, t.assistant.thread.readAloudFailed)
+      notifyError(error, t.composer.voiceConversationFailed)
     },
     [t]
   )
+
 
   const conversation = useRealtimeConversation({
     createClient: realtimeVoiceFactory,
@@ -98,6 +102,11 @@ export function useComposerVoice({
     sessionId
   })
 
+  const endConversation = useCallback(async () => {
+    setVoiceConversationActive(false)
+    await conversation.end()
+  }, [conversation])
+
   // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting
   // without a configured Realtime factory fails closed with an actionable
   // notice rather than silently no-opping or falling back to the old loop.
@@ -107,23 +116,17 @@ export function useComposerVoice({
     }
 
     if (voiceConversationActive) {
-      setVoiceConversationActive(false)
-      void conversation.end()
+      void endConversation()
     } else {
       setVoiceConversationActive(true)
     }
-  }, [conversation, disabled, voiceConversationActive])
+  }, [disabled, endConversation, voiceConversationActive])
 
   useEffect(() => onComposerVoiceToggleRequest(toggleVoiceConversation), [toggleVoiceConversation])
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
   const startConversation = useCallback(() => setVoiceConversationActive(true), [])
-
-  const endConversation = useCallback(() => {
-    setVoiceConversationActive(false)
-    void conversation.end()
-  }, [conversation])
 
   const handleToggleAutoSpeak = useCallback(() => {
     void setAutoSpeakReplies(!$autoSpeakReplies.get()).catch(error =>

@@ -37,6 +37,18 @@ interface MessageStreamOptions {
     storedSessionId?: string | null,
     runtimeSessionId?: string | null
   ) => Promise<void>
+  onVoiceIntentProgress?: (progress: {
+    correlationId: string
+    sessionId: string
+    status: 'queued' | 'running' | 'approval_pending' | 'completed' | 'failed' | 'interrupted' | 'rejected'
+  }) => void
+  onVoiceIntentTerminal?: (result: {
+    correlationId: string
+    deliveryId: string
+    providerSessionId: string
+    sessionId: string
+    text: string
+  }) => void
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
@@ -56,6 +68,8 @@ interface QueuedStreamDeltas {
 export function useMessageStream({
   activeSessionIdRef,
   hydrateFromStoredSession,
+  onVoiceIntentProgress,
+  onVoiceIntentTerminal,
   queryClient,
   refreshHermesConfig,
   refreshSessions,
@@ -520,6 +534,8 @@ export function useMessageStream({
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
+    onVoiceIntentProgress,
+    onVoiceIntentTerminal,
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,

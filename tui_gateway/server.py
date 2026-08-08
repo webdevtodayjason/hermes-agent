@@ -33,6 +33,7 @@ from hermes_cli.realtime_voice import (
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from agent.redact import redact_sensitive_text
 from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
@@ -1175,6 +1176,24 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     to the TUI client (#48456 — third egress transport alongside the chat
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
+    session = _sessions.get(sid)
+    correlation_id = (
+        session.get("_active_correlated_turn_id")
+        if isinstance(session, dict)
+        else None
+    )
+    if (
+        isinstance(session, dict)
+        and isinstance(correlation_id, str)
+        and _VOICE_INTENT_ID_RE.fullmatch(correlation_id) is not None
+    ):
+        _set_correlated_turn_status(
+            session,
+            correlation_id,
+            "approval_pending",
+            sid=sid,
+        )
+
     payload = dict(data or {})
     if "choices" not in payload:
         if payload.get("smart_denied"):
@@ -1304,6 +1323,611 @@ def _voice_owned_session(params: dict, rid: str) -> tuple[dict | None, dict | No
     if owner is not None and current_transport() is not owner:
         return None, _err(rid, 4001, "session not found")
     return session, None
+
+
+_VOICE_INTENT_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,256}")
+_VOICE_INTENT_MAX_CHARS = 4_000
+_VOICE_TERMINAL_RESULT_MAX_CHARS = 4_000
+_MAX_PENDING_CORRELATED_TURNS = 3
+_MAX_NARRATION_DELIVERY_ATTEMPTS = 2
+# N2a: user barge-in (narration_interrupted) is not a delivery failure — the
+# result stays re-deliverable once the channel is idle — but the redelivery
+# lane must stay bounded so the N3 storm remains structurally impossible.
+_MAX_NARRATION_INTERRUPT_REDELIVERIES = 5
+
+
+def _enqueue_correlated_turn(
+    session: dict,
+    *,
+    correlation_id: str,
+    source: str,
+    text: str,
+) -> None:
+    """Queue a non-interrupting canonical turn with reusable correlation metadata."""
+    session.setdefault("_correlated_turn_queue", []).append(
+        {
+            "correlation_id": correlation_id,
+            "source": source,
+            "text": text,
+        }
+    )
+    session.setdefault("_correlated_turns", {})[correlation_id] = {
+        "status": "queued",
+        "queued_at": time.time(),
+    }
+
+
+def _voice_intent_grant_active(session: dict) -> bool:
+    grant = session.get("_voice_intent_grant")
+    if not isinstance(grant, dict) or grant.get("active") is not True:
+        return False
+    try:
+        return float(grant.get("expires_at") or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def _voice_intents_meta_key(session: dict) -> str | None:
+    session_key = str(session.get("session_key") or "").strip()
+    return f"voice-intents:{session_key}" if session_key else None
+
+
+def _persist_voice_intent_states(session: dict) -> bool:
+    key = _voice_intents_meta_key(session)
+    db = _get_db()
+    if key is None or db is None:
+        return False
+    states = session.get("_correlated_turns", {})
+    if not isinstance(states, dict):
+        return False
+    try:
+        db.set_meta(key, json.dumps(states, separators=(",", ":"), sort_keys=True))
+        return True
+    except Exception:
+        logger.exception("Failed to persist correlated voice intent state")
+        return False
+
+
+def _restore_voice_intent_states(session: dict) -> None:
+    key = _voice_intents_meta_key(session)
+    db = _get_db()
+    if key is None or db is None:
+        return
+    try:
+        raw = db.get_meta(key)
+        loaded = json.loads(raw) if isinstance(raw, str) and raw else {}
+    except Exception:
+        logger.exception("Failed to restore correlated voice intent state")
+        return
+    if not isinstance(loaded, dict):
+        return
+    turns = session.setdefault("_correlated_turns", {})
+    for correlation_id, state in loaded.items():
+        if (
+            isinstance(correlation_id, str)
+            and _VOICE_INTENT_ID_RE.fullmatch(correlation_id) is not None
+            and isinstance(state, dict)
+            and state.get("status") in {
+                "queued",
+                "running",
+                "approval_pending",
+                "completed",
+                "failed",
+                "interrupted",
+                "rejected",
+            }
+        ):
+            restored = dict(state)
+            if (
+                restored.get("status") == "completed"
+                and isinstance(restored.get("result_text"), str)
+            ):
+                try:
+                    delivery_attempt = max(1, int(restored.get("delivery_attempt") or 1))
+                except (TypeError, ValueError):
+                    delivery_attempt = 1
+                delivery_kind = str(restored.get("delivery_kind") or "").strip()
+                if delivery_kind not in {"initial", "retry", "recovery"}:
+                    delivery_kind = "retry" if delivery_attempt >= 2 else "initial"
+                restored["delivery_attempt"] = delivery_attempt
+                restored["delivery_kind"] = delivery_kind
+                restored["delivery_recovery_used"] = bool(
+                    restored.get("delivery_recovery_used")
+                    or delivery_kind == "recovery"
+                )
+                if (
+                    restored.get("delivery_stage")
+                    in {"narration_failed", "narration_interrupted"}
+                    and (delivery_attempt >= 2 or delivery_kind in {"retry", "recovery"})
+                ):
+                    restored["delivery_exhausted"] = True
+                    restored.setdefault("delivery_exhausted_at", time.time())
+            restored["terminal_emitted"] = False
+            turns.setdefault(correlation_id, restored)
+
+
+def _set_correlated_turn_status(
+    session: dict,
+    correlation_id: str,
+    status: str,
+    *,
+    result_text: str | None = None,
+    sid: str | None = None,
+) -> None:
+    terminal_payload = None
+    progress_payload = None
+    with session["history_lock"]:
+        state = session.setdefault("_correlated_turns", {}).setdefault(correlation_id, {})
+        status_changed = state.get("status") != status
+        state["status"] = status
+        if status_changed:
+            state.setdefault(f"{status}_at", time.time())
+            progress_payload = {
+                "correlation_id": correlation_id,
+                "status": status,
+            }
+        if status in {"completed", "failed", "interrupted", "rejected"}:
+            if session.get("_active_correlated_turn_id") == correlation_id:
+                session.pop("_active_correlated_turn_id", None)
+        visible_result = (
+            redact_sensitive_text(result_text).strip()
+            if isinstance(result_text, str)
+            else ""
+        )
+        if status == "completed" and visible_result:
+            bounded_result = visible_result[:_VOICE_TERMINAL_RESULT_MAX_CHARS]
+            if not isinstance(state.get("result_text"), str):
+                state["result_text"] = bounded_result
+                state["result_truncated"] = len(visible_result) > len(bounded_result)
+                state["delivery_id"] = uuid.uuid4().hex
+                grant = session.get("_voice_intent_grant")
+                state["delivery_provider_session_id"] = (
+                    grant.get("provider_session_id")
+                    if isinstance(grant, dict)
+                    else None
+                )
+                state["delivery_stage"] = "pending"
+                state["delivery_attempt"] = 1
+                state["delivery_kind"] = "initial"
+                state["delivery_recovery_used"] = False
+                state["delivery_exhausted"] = False
+            if state.get("terminal_emitted") is not True:
+                state["terminal_emitted"] = True
+                terminal_payload = {
+                    "correlation_id": correlation_id,
+                    "delivery_id": state["delivery_id"],
+                    "provider_session_id": state.get("delivery_provider_session_id"),
+                    "status": "completed",
+                    "text": state["result_text"],
+                    "truncated": bool(state.get("result_truncated")),
+                }
+    persisted = _persist_voice_intent_states(session)
+    if not persisted:
+        if terminal_payload is not None:
+            with session["history_lock"]:
+                current_state = session.get("_correlated_turns", {}).get(correlation_id)
+                if isinstance(current_state, dict):
+                    current_state["terminal_emitted"] = False
+        return
+    if progress_payload is not None and sid:
+        _emit("voice.intent.progress", sid, progress_payload)
+    if terminal_payload is not None and sid:
+        _emit("voice.intent.terminal", sid, terminal_payload)
+
+
+def _schedule_correlated_turn(rid: str, sid: str, session: dict, entry: dict) -> None:
+    """Build the canonical agent if needed, then run one already-claimed turn."""
+    correlation_id = entry["correlation_id"]
+    _ensure_session_db_row(session)
+    _persist_branch_seed(session)
+    _start_agent_build(sid, session)
+
+    def run_after_agent_ready() -> None:
+        err = _wait_agent(session, rid)
+        if err:
+            _set_correlated_turn_status(session, correlation_id, "failed", sid=sid)
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": err.get("error", {}).get(
+                        "message", "agent initialization failed"
+                    )
+                },
+            )
+            _transition_session_idle(session)
+            _drain_correlated_turn(rid, sid, session)
+            return
+        with session["history_lock"]:
+            should_finish = bool(
+                session.get("_turn_cancel_requested") or not session.get("running")
+            )
+        if should_finish:
+            _set_correlated_turn_status(session, correlation_id, "interrupted", sid=sid)
+            _transition_session_idle(session)
+            _drain_correlated_turn(rid, sid, session)
+            return
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            entry["text"],
+            correlation_id=correlation_id,
+        )
+
+    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    session["_run_thread"] = run_thread
+    run_thread.start()
+
+
+def _drain_correlated_turn(rid: str, sid: str, session: dict) -> bool:
+    """Claim and schedule the next reusable correlated turn without interruption."""
+    with session["history_lock"]:
+        queue_items = session.setdefault("_correlated_turn_queue", [])
+        if session.get("running") or not queue_items:
+            return False
+        entry = queue_items.pop(0)
+        session["running"] = True
+        session["_active_correlated_turn_id"] = entry["correlation_id"]
+        session["_turn_cancel_requested"] = False
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, entry["text"])
+        state = session.setdefault("_correlated_turns", {}).setdefault(
+            entry["correlation_id"], {}
+        )
+        state["status"] = "running"
+        state.setdefault("running_at", time.time())
+    _persist_voice_intent_states(session)
+    _emit(
+        "voice.intent.progress",
+        sid,
+        {"correlation_id": entry["correlation_id"], "status": "running"},
+    )
+    try:
+        _schedule_correlated_turn(rid, sid, session, entry)
+    except Exception:
+        _set_correlated_turn_status(
+            session, entry["correlation_id"], "failed", sid=sid
+        )
+        _transition_session_idle(session)
+        raise
+    return True
+
+
+@method("voice.intent.dispatch")
+def _voice_intent_dispatch(rid, params: dict) -> dict:
+    """Accept one bounded provider intent through a live voice-session grant."""
+    allowed = {"call_id", "intent", "item_id", "session_id"}
+    if set(params) - allowed:
+        return _err(rid, -32602, "invalid voice.intent.dispatch params")
+
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if not _voice_intent_grant_active(session):
+        return _err(rid, 4012, "live voice intent grant required")
+
+    call_id = params.get("call_id")
+    item_id = params.get("item_id")
+    intent = params.get("intent")
+    if (
+        not isinstance(call_id, str)
+        or _VOICE_INTENT_ID_RE.fullmatch(call_id) is None
+        or not isinstance(item_id, str)
+        or _VOICE_INTENT_ID_RE.fullmatch(item_id) is None
+        or not isinstance(intent, str)
+        or not intent.strip()
+        or len(intent) > _VOICE_INTENT_MAX_CHARS
+        or intent.lstrip().startswith("/")
+    ):
+        return _err(rid, -32602, "invalid voice.intent.dispatch params")
+
+    intent = intent.strip()
+    with session["history_lock"]:
+        turns = session.setdefault("_correlated_turns", {})
+        existing = turns.get(call_id)
+        if isinstance(existing, dict):
+            return _ok(
+                rid,
+                {
+                    "correlation_id": call_id,
+                    "status": str(existing.get("status") or "queued"),
+                },
+            )
+        pending_count = sum(
+            1
+            for state in turns.values()
+            if isinstance(state, dict)
+            and state.get("status") in {"queued", "running", "approval_pending"}
+        )
+        if pending_count >= _MAX_PENDING_CORRELATED_TURNS:
+            turns[call_id] = {
+                "status": "rejected",
+                "rejected_at": time.time(),
+            }
+            dispatch_status = "rejected"
+            should_drain = False
+        else:
+            _enqueue_correlated_turn(
+                session,
+                correlation_id=call_id,
+                source="voice",
+                text=intent,
+            )
+            dispatch_status = "queued"
+            should_drain = not bool(session.get("running"))
+
+    owner_sid = str(params.get("session_id") or "")
+    _persist_voice_intent_states(session)
+    _emit(
+        "voice.intent.progress",
+        owner_sid,
+        {"correlation_id": call_id, "status": dispatch_status},
+    )
+    if dispatch_status == "rejected":
+        return _ok(rid, {"correlation_id": call_id, "status": "rejected"})
+
+    # A correlated dispatch never interrupts or steers a live canonical turn.
+    # The turn-tail drain owns execution and preserves human queued-turn priority.
+    session["last_active"] = time.time()
+    if should_drain:
+        _drain_correlated_turn(rid, owner_sid, session)
+    return _ok(rid, {"correlation_id": call_id, "status": "queued"})
+
+
+@method("voice.intent.status")
+def _voice_intent_status(rid, params: dict) -> dict:
+    """Return one granted voice dispatch's correlation-scoped state."""
+    if set(params) != {"call_id", "session_id"}:
+        return _err(rid, -32602, "invalid voice.intent.status params")
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if not _voice_intent_grant_active(session):
+        return _err(rid, 4012, "live voice intent grant required")
+    call_id = params.get("call_id")
+    if not isinstance(call_id, str) or _VOICE_INTENT_ID_RE.fullmatch(call_id) is None:
+        return _err(rid, -32602, "invalid voice.intent.status params")
+    with session["history_lock"]:
+        state = session.get("_correlated_turns", {}).get(call_id)
+        if not isinstance(state, dict):
+            return _err(rid, 4004, "voice intent correlation not found")
+        status = str(state.get("status") or "queued")
+    return _ok(rid, {"correlation_id": call_id, "status": status})
+
+
+def _pending_voice_result_payloads(session: dict) -> list[dict]:
+    grant = session.get("_voice_intent_grant")
+    provider_session_id = (
+        grant.get("provider_session_id") if isinstance(grant, dict) else None
+    )
+    results = []
+    for correlation_id, state in session.get("_correlated_turns", {}).items():
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "completed"
+            or state.get("delivery_stage") == "narration_completed"
+            or not isinstance(state.get("result_text"), str)
+        ):
+            continue
+        delivery_stage = str(state.get("delivery_stage") or "pending")
+        if state.get("delivery_exhausted") is True:
+            continue
+        same_provider = state.get("delivery_provider_session_id") == provider_session_id
+        if same_provider and delivery_stage in {"consumed", "narration_started"}:
+            continue
+        current_attempt = int(state.get("delivery_attempt") or 1)
+        # N2a: failures and user interrupts exhaust on separate counters.
+        # Legacy states minted before the counters counted every redelivery
+        # as a failure, so a missing failure counter on a failed stage
+        # derives from the attempt number (preserves their old exhaustion).
+        failure_count = state.get("delivery_failure_count")
+        if failure_count is None and delivery_stage == "narration_failed":
+            failure_count = current_attempt
+        failure_count = int(failure_count or 0)
+        interrupt_count = int(state.get("delivery_interrupt_count") or 0)
+        if same_provider and (
+            (
+                delivery_stage == "narration_failed"
+                and failure_count >= _MAX_NARRATION_DELIVERY_ATTEMPTS
+            )
+            or (
+                delivery_stage == "narration_interrupted"
+                and interrupt_count >= _MAX_NARRATION_INTERRUPT_REDELIVERIES
+            )
+        ):
+            state["delivery_exhausted"] = True
+            state.setdefault("delivery_exhausted_at", time.time())
+            continue
+        if (
+            not same_provider
+            or delivery_stage in {"narration_failed", "narration_interrupted"}
+        ):
+            if not same_provider and state.get("delivery_recovery_used") is True:
+                state["delivery_exhausted"] = True
+                state.setdefault("delivery_exhausted_at", time.time())
+                continue
+            state["delivery_id"] = uuid.uuid4().hex
+            state["delivery_provider_session_id"] = provider_session_id
+            state["delivery_stage"] = "pending"
+            state["delivery_acknowledged_stages"] = []
+            state["delivery_attempt"] = current_attempt + 1
+            # Materialize the split counters on every remint so ack-time
+            # accounting never falls back to the legacy kind-based guess.
+            state["delivery_failure_count"] = failure_count
+            state["delivery_interrupt_count"] = interrupt_count
+            state["delivery_kind"] = "retry" if same_provider else "recovery"
+            if not same_provider:
+                state["delivery_recovery_used"] = True
+            state["delivery_rebound_at"] = time.time()
+            state["terminal_emitted"] = False
+        results.append(
+            {
+                "correlation_id": correlation_id,
+                "delivery_id": state["delivery_id"],
+                "provider_session_id": provider_session_id,
+                "status": "completed",
+                "text": state["result_text"],
+                "truncated": bool(state.get("result_truncated")),
+            }
+        )
+    return results
+
+
+def _pending_voice_progress_payloads(session: dict) -> list[dict]:
+    """Return state-only progress for reconnect hydration; never include intent data."""
+    visible = {
+        "queued",
+        "running",
+        "approval_pending",
+        "failed",
+        "interrupted",
+        "rejected",
+    }
+    return [
+        {"correlation_id": correlation_id, "status": state.get("status")}
+        for correlation_id, state in session.get("_correlated_turns", {}).items()
+        if isinstance(correlation_id, str)
+        and isinstance(state, dict)
+        and state.get("status") in visible
+    ]
+
+
+@method("voice.intent.pending")
+def _voice_intent_pending(rid, params: dict) -> dict:
+    """Replay completed results not yet consumed by the owning voice session."""
+    if set(params) != {"session_id"}:
+        return _err(rid, -32602, "invalid voice.intent.pending params")
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if not _voice_intent_grant_active(session):
+        return _err(rid, 4012, "live voice intent grant required")
+    with session["history_lock"]:
+        results = _pending_voice_result_payloads(session)
+    if not _persist_voice_intent_states(session):
+        return _err(rid, 5000, "voice intent state could not be durably persisted")
+    return _ok(rid, {"results": results})
+
+
+@method("voice.intent.ack")
+def _voice_intent_ack(rid, params: dict) -> dict:
+    """Record owner-scoped delivery and narration phases idempotently."""
+    allowed = {
+        "call_id",
+        "delivery_id",
+        "provider_session_id",
+        "session_id",
+        "stage",
+    }
+    stages = {
+        "consumed",
+        "narration_started",
+        "narration_completed",
+        "narration_interrupted",
+        "narration_failed",
+    }
+    requested_stage = params.get("stage")
+    if set(params) != allowed or requested_stage not in stages:
+        return _err(rid, -32602, "invalid voice.intent.ack params")
+    session, err = _voice_owned_session(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if not _voice_intent_grant_active(session):
+        return _err(rid, 4012, "live voice intent grant required")
+    call_id = params.get("call_id")
+    delivery_id = params.get("delivery_id")
+    provider_session_id = params.get("provider_session_id")
+    if any(
+        not isinstance(value, str) or _VOICE_INTENT_ID_RE.fullmatch(value) is None
+        for value in (call_id, delivery_id, provider_session_id)
+    ):
+        return _err(rid, -32602, "invalid voice.intent.ack params")
+    with session["history_lock"]:
+        state = session.get("_correlated_turns", {}).get(call_id)
+        grant = session.get("_voice_intent_grant")
+        active_provider_session_id = (
+            grant.get("provider_session_id") if isinstance(grant, dict) else None
+        )
+        if (
+            not isinstance(state, dict)
+            or state.get("delivery_id") != delivery_id
+            or state.get("delivery_provider_session_id") != provider_session_id
+            or active_provider_session_id != provider_session_id
+        ):
+            return _err(rid, 4004, "voice intent delivery not found")
+
+        current_stage = str(state.get("delivery_stage") or "pending")
+        legal_next = {
+            "pending": {"consumed"},
+            "consumed": {
+                "narration_started",
+                "narration_interrupted",
+                "narration_failed",
+            },
+            "narration_started": {
+                "narration_completed",
+                "narration_interrupted",
+                "narration_failed",
+            },
+            "narration_completed": set(),
+            "narration_interrupted": set(),
+            "narration_failed": set(),
+        }
+        acknowledged_stages = state.setdefault("delivery_acknowledged_stages", [])
+        if not isinstance(acknowledged_stages, list):
+            acknowledged_stages = []
+            state["delivery_acknowledged_stages"] = acknowledged_stages
+        if requested_stage != current_stage:
+            if requested_stage in acknowledged_stages:
+                pass
+            elif requested_stage not in legal_next.get(current_stage, set()):
+                return _err(rid, 4090, "invalid voice intent delivery transition")
+            else:
+                state["delivery_stage"] = requested_stage
+                acknowledged_stages.append(requested_stage)
+                state[f"{requested_stage}_at"] = time.time()
+                state["ack_provider_session_id"] = provider_session_id
+                if requested_stage == "narration_failed":
+                    delivery_kind = str(state.get("delivery_kind") or "initial")
+                    prior_failures = state.get("delivery_failure_count")
+                    if prior_failures is None:
+                        # Legacy delivery minted before the split counters:
+                        # a retry/recovery delivery implies one prior failure.
+                        prior_failures = 1 if delivery_kind in {"retry", "recovery"} else 0
+                    failures = int(prior_failures) + 1
+                    state["delivery_failure_count"] = failures
+                    if (
+                        delivery_kind == "recovery"
+                        or failures >= _MAX_NARRATION_DELIVERY_ATTEMPTS
+                    ):
+                        state["delivery_exhausted"] = True
+                        state.setdefault("delivery_exhausted_at", time.time())
+                elif requested_stage == "narration_interrupted":
+                    # N2a: user barge-in over the result is not a failure;
+                    # count it on its own bounded lane.
+                    interrupts = int(state.get("delivery_interrupt_count") or 0) + 1
+                    state["delivery_interrupt_count"] = interrupts
+                    if interrupts >= _MAX_NARRATION_INTERRUPT_REDELIVERIES:
+                        state["delivery_exhausted"] = True
+                        state.setdefault("delivery_exhausted_at", time.time())
+        elif requested_stage not in acknowledged_stages:
+            acknowledged_stages.append(requested_stage)
+        response_stage = str(state.get("delivery_stage") or requested_stage)
+    if not _persist_voice_intent_states(session):
+        return _err(rid, 5000, "voice intent state could not be durably persisted")
+    return _ok(
+        rid,
+        {
+            "correlation_id": call_id,
+            "delivery_id": delivery_id,
+            "stage": response_stage,
+        },
+    )
 
 
 def _flush_voice_transcripts_locked(session: dict) -> dict[str, bool]:
@@ -1455,6 +2079,7 @@ def _voice_session_create(rid, params: dict) -> dict:
     session_key = str(session.get("session_key") or "").strip()
     if not session_key:
         return _err(rid, 4001, "session has no durable conversation")
+    _restore_voice_intent_states(session)
 
     if "profile" in params:
         return _err(rid, -32602, "invalid voice.session.create params")
@@ -1465,6 +2090,7 @@ def _voice_session_create(rid, params: dict) -> dict:
         result = mint_realtime_session(
             session_key,
             profile=_current_profile_name(),
+            enable_intent_dispatch=True,
         )
     except RealtimeCredentialUnavailable as exc:
         return _err(rid, 4012, str(exc))
@@ -1472,9 +2098,24 @@ def _voice_session_create(rid, params: dict) -> dict:
         logger.exception("OpenAI Realtime session mint failed")
         return _err(rid, 5000, "OpenAI Realtime session could not be created")
 
+    session["_voice_intent_grant"] = {
+        "active": True,
+        "expires_at": result.get("expires_at"),
+        "provider_session_id": result.get("provider_session_id"),
+    }
+    with session["history_lock"]:
+        pending_results = _pending_voice_result_payloads(session)
+        pending_intents = _pending_voice_progress_payloads(session)
+    if not _persist_voice_intent_states(session):
+        return _err(rid, 5000, "voice intent state could not be durably persisted")
     return _ok(
         rid,
-        {**result, "owner_session_id": params.get("session_id")},
+        {
+            **result,
+            "owner_session_id": params.get("session_id"),
+            "pending_intents": pending_intents,
+            "pending_results": pending_results,
+        },
     )
 
 
@@ -9281,7 +9922,14 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    correlation_id: str | None = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -9553,6 +10201,26 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+            if correlation_id is not None:
+                terminal_status = {
+                    "complete": "completed",
+                    "interrupted": "interrupted",
+                }.get(status, "failed")
+                narratable_result = (
+                    raw
+                    if terminal_status == "completed"
+                    and status_note is None
+                    and isinstance(raw, str)
+                    and raw.strip()
+                    else None
+                )
+                _set_correlated_turn_status(
+                    session,
+                    correlation_id,
+                    terminal_status,
+                    result_text=narratable_result,
+                    sid=sid,
+                )
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -9663,6 +10331,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 and isinstance(raw, str)
                 and raw.strip()
                 and _voice_tts_enabled()
+                and correlation_id is None
+                and not _voice_intent_grant_active(session)
             ):
                 try:
                     from hermes_cli.voice import speak_text
@@ -9677,6 +10347,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
             import traceback
+
+            if correlation_id is not None:
+                _set_correlated_turn_status(
+                    session, correlation_id, "failed", sid=sid
+                )
 
             trace = traceback.format_exc()
             try:
@@ -9709,6 +10384,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        # Correlated provider/automation turns are lower priority than a human
+        # prompt that arrived mid-turn, but higher priority than auto follow-ups.
+        if _drain_correlated_turn(rid, sid, session):
             return
 
         # Chain a goal-continuation turn if the judge said so. We do

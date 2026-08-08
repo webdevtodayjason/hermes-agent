@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef } from 'react'
 
 import { playSpeechText } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
+import { $realtimeAudioSessions, isRealtimeAudioOwned } from '@/store/realtime-audio'
 import { $messages } from '@/store/session'
 import { $voicePlayback } from '@/store/voice-playback'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
@@ -31,10 +32,12 @@ interface UseAutoSpeakReplies {
 }
 
 /**
- * Narrate completed canonical assistant turns during active Spoke, or when the
- * standalone `voice.auto_tts` preference is enabled. Never overlaps clips: a
- * reply landing mid-playback is held until playback becomes idle. A backlog
- * collapses to the latest terminal reply.
+ * Narrate completed canonical assistant turns only when the standalone
+ * `voice.auto_tts` preference is enabled and Spoke is inactive. Active Spoke
+ * owns provider audio, while correlation-scoped durable-result narration is
+ * delivered through the Realtime client's dedicated B2 channel. Never overlaps
+ * clips: a reply landing mid-playback is held until playback becomes idle. A
+ * backlog collapses to the latest terminal reply.
  */
 export function useAutoSpeakReplies({
   conversationActive,
@@ -47,7 +50,11 @@ export function useAutoSpeakReplies({
   userSpeaking = false
 }: UseAutoSpeakReplies) {
   const enabled = useStore($autoSpeakReplies)
-  const mode = conversationActive ? 'spoke' : enabled ? 'standalone' : 'off'
+  // Global Realtime audio ownership gates exactly like an active local
+  // conversation: any live session (composer-started or controller-started)
+  // owns speech, so generic TTS stays off (RED-4 single-speaker rule).
+  const realtimeOwned = useStore($realtimeAudioSessions) > 0
+  const mode = conversationActive || realtimeOwned ? 'off' : enabled ? 'standalone' : 'off'
   const lifecycleKey = `${sessionId ?? ''}:${mode}`
 
   const latest = useRef({
@@ -118,6 +125,7 @@ export function useAutoSpeakReplies({
 
       if (
         userSpeaking ||
+        isRealtimeAudioOwned() ||
         isNarrationBlocked?.() ||
         isUserSpeaking?.() ||
         $voicePlayback.get().status !== 'idle'

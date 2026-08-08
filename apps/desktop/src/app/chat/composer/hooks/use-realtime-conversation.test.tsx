@@ -3,6 +3,11 @@ import { startTransition, Suspense, useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  publishVoiceIntentProgress,
+  publishVoiceIntentTerminal
+} from '@/store/voice-intent-results'
+
+import {
   type RealtimeVoiceClientLike,
   type RealtimeVoiceFactory,
   type RealtimeVoiceStatus,
@@ -18,10 +23,12 @@ function makeFactory() {
   const onUserTranscripts: ((text: string, itemId: string) => void)[] = []
 
   const client: RealtimeVoiceClientLike = {
+    announceCanonicalProgress: vi.fn(),
     start: vi.fn(async () => undefined),
     end: vi.fn(async () => undefined),
     setMuted: vi.fn(),
-    interrupt: vi.fn()
+    interrupt: vi.fn(),
+    narrateCanonicalResult: vi.fn()
   }
 
   const factory: RealtimeVoiceFactory = vi.fn(options => {
@@ -56,6 +63,124 @@ function makeFactory() {
 }
 
 describe('useRealtimeConversation', () => {
+  it('routes terminal narration only to the committed live matching session', async () => {
+    const { client, factory } = makeFactory()
+    publishVoiceIntentTerminal({
+      correlationId: 'call-before-connect',
+      deliveryId: 'delivery-before-connect',
+      providerSessionId: 'provider-s1',
+      sessionId: 's1',
+      text: 'Must not replay after connect'
+    })
+
+    const { rerender } = renderHook(
+      ({ enabled, sessionId }) =>
+        useRealtimeConversation({
+          createClient: factory,
+          enabled,
+          onFatalError: vi.fn(),
+          onUserTranscript: vi.fn(),
+          sessionId
+        }),
+      { initialProps: { enabled: true, sessionId: 's1' } }
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalledOnce())
+    act(() => publishVoiceIntentTerminal({
+      correlationId: 'call-s1',
+      deliveryId: 'delivery-s1',
+      providerSessionId: 'provider-s1',
+      sessionId: 's1',
+      text: 'Canonical result'
+    }))
+    expect(client.narrateCanonicalResult).toHaveBeenCalledWith({
+      correlationId: 'call-s1',
+      deliveryId: 'delivery-s1',
+      providerSessionId: 'provider-s1',
+      text: 'Canonical result'
+    })
+
+    rerender({ enabled: false, sessionId: 's1' })
+    act(() => publishVoiceIntentTerminal({
+      correlationId: 'call-disabled',
+      deliveryId: 'delivery-disabled',
+      providerSessionId: 'provider-s1',
+      sessionId: 's1',
+      text: 'Must not narrate after deactivation'
+    }))
+    rerender({ enabled: true, sessionId: 's2' })
+    act(() => publishVoiceIntentTerminal({
+      correlationId: 'call-stale',
+      deliveryId: 'delivery-stale',
+      providerSessionId: 'provider-s1',
+      sessionId: 's1',
+      text: 'Must not cross sessions'
+    }))
+
+    expect(client.narrateCanonicalResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows terse session-scoped progress and surfaces failed work for retry', async () => {
+    const { client, factory } = makeFactory()
+    const onFatalError = vi.fn()
+
+    const { result, rerender } = renderHook(
+      ({ enabled, sessionId }) => useRealtimeConversation({
+        createClient: factory,
+        enabled,
+        onFatalError,
+        onUserTranscript: vi.fn(),
+        sessionId
+      }),
+      { initialProps: { enabled: true, sessionId: 's1' } }
+    )
+
+    await waitFor(() => expect(client.start).toHaveBeenCalledOnce())
+    act(() => publishVoiceIntentProgress({
+      correlationId: 'call-progress', sessionId: 's1', status: 'queued'
+    }))
+    expect(result.current.progressText).toBe('Queued…')
+
+    act(() => publishVoiceIntentProgress({
+      correlationId: 'call-stale', sessionId: 's2', status: 'running'
+    }))
+    expect(result.current.progressText).toBe('Queued…')
+
+    act(() => publishVoiceIntentProgress({
+      correlationId: 'call-progress', sessionId: 's1', status: 'running'
+    }))
+    expect(result.current.progressText).toBe('Working…')
+
+    act(() => publishVoiceIntentProgress({
+      correlationId: 'call-progress', sessionId: 's1', status: 'approval_pending'
+    }))
+    expect(result.current.progressText).toBe('Needs approval…')
+    expect(client.announceCanonicalProgress).toHaveBeenCalledWith({
+      correlationId: 'call-progress',
+      status: 'approval_pending'
+    })
+
+    act(() => publishVoiceIntentTerminal({
+      correlationId: 'call-progress',
+      deliveryId: 'delivery-progress',
+      providerSessionId: 'provider-progress',
+      sessionId: 's1',
+      text: 'Verified result'
+    }))
+    expect(result.current.progressText).toBe('')
+
+    act(() => publishVoiceIntentProgress({
+      correlationId: 'call-failed', sessionId: 's1', status: 'failed'
+    }))
+    expect(result.current.progressText).toBe('Work failed. Please retry.')
+    expect(onFatalError).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'Canonical voice work failed. Please retry.'
+    }))
+
+    rerender({ enabled: false, sessionId: 's1' })
+    expect(result.current.progressText).toBe('')
+  })
+
   it('exposes ephemeral live captions and clears them on end and session replacement', async () => {
     const { client, emitUserDelta, factory } = makeFactory()
     const onUserTranscript = vi.fn()

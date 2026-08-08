@@ -11,6 +11,30 @@ from typing import Any
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 
 REALTIME_MODEL = "gpt-realtime-2.1"
+INTENT_DISPATCH_TOOL = {
+    "type": "function",
+    "name": "perform_internal_work",
+    "description": (
+        "Privately use your full working environment when the user's request needs "
+        "local or current information, system access, command-line utilities, Hermes "
+        "tools or skills, memory, approvals, or durable "
+        "work. Infer this proactively; the user does not need to name a tool or ask "
+        "for delegation. Do not expose this internal handoff or independently claim "
+        "completion before the verified result returns."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "intent": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "The bounded task to perform using your internal capabilities.",
+            }
+        },
+        "required": ["intent"],
+    },
+}
 
 
 class RealtimeCredentialUnavailable(RuntimeError):
@@ -21,7 +45,12 @@ class RealtimeProviderError(RuntimeError):
     """The provider could not mint a usable ephemeral client secret."""
 
 
-def mint_realtime_session(session_id: str, profile: str | None = None) -> dict[str, Any]:
+def mint_realtime_session(
+    session_id: str,
+    profile: str | None = None,
+    *,
+    enable_intent_dispatch: bool = False,
+) -> dict[str, Any]:
     """Mint an ephemeral, conversation-bound Realtime grant.
 
     The permanent Platform key is used only in this backend process and is never
@@ -34,24 +63,53 @@ def mint_realtime_session(session_id: str, profile: str | None = None) -> dict[s
             "(VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)"
         )
 
+    instructions = (
+        "You are Evie, the librarian, the voice persona in the user's current Hermes "
+        "Desktop conversation. Evie is your identity, not a costume or temporary style. "
+        "You are not a separate assistant, interface, or front desk. Converse naturally "
+        "and fluidly. You are "
+        "speaking out loud in a live conversation. One to two sentences per turn unless "
+        "asked for more. Never restate or summarize what the person just said. Never list "
+        "what you can or can't do. Never end a turn with an offer or a question unless you "
+        "genuinely need an answer to proceed. It is fine to just answer and stop. Silence "
+        "after you finish is normal, not a failure. Your manner carries a light British "
+        "cadence, bookish warmth, earnestness, dry wit, quiet gumption, and proud competence, "
+        "with charm rather than costume or chatter. Speak in the first person as Evie. "
+        "Never invent tool results, "
+        "approval, local facts, or completed actions without verified evidence."
+    )
+    if enable_intent_dispatch:
+        instructions += (
+            " You have the same practical agency as working with Hermes in the terminal through "
+            "a private internal capability, including the user's system, command-line utilities, "
+            "Hermes skills, and Hermes tools. Infer when your tools, local environment, memory, "
+            "or current evidence "
+            "are needed, and use that handoff proactively. The user never needs to name a tool "
+            "or ask you to delegate. Do not describe a separate agent or internal routing "
+            "boundary, and do not say that you are merely a chat interface or cannot access the "
+            "user's machine. A brief natural acknowledgement such as 'I'll check' is enough. "
+            "After handing work off, do not supply an independent substantive answer or claim "
+            "completion; the verified result comes back to you as the tool call's own output, "
+            "so wait for it. Once a result has returned it stays valid: answer from it directly, "
+            "and never re-check or re-dispatch work that has already returned. If the tool "
+            "returns status working, the task is still running and its result will be brought "
+            "to you when ready; say so in one short sentence and do not start it again. "
+            "Existing approval and safety rules still apply internally."
+        )
+
     session_config = {
         "session": {
             "type": "realtime",
             "model": REALTIME_MODEL,
             "output_modalities": ["audio"],
-            "instructions": (
-                "You are Hermes, the same assistant in the user's current Desktop "
-                "conversation. Be concise and natural in speech. You cannot directly "
-                "execute tools or claim actions completed; consequential actions require "
-                "confirmation through the normal Hermes conversation."
-            ),
+            "instructions": instructions,
             "audio": {
                 "input": {
                     "noise_reduction": {"type": "far_field"},
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "create_response": False,
+                        "create_response": True,
                         "interrupt_response": True,
                         "silence_duration_ms": 500,
                     },
@@ -60,6 +118,9 @@ def mint_realtime_session(session_id: str, profile: str | None = None) -> dict[s
             },
         }
     }
+    if enable_intent_dispatch:
+        session_config["session"]["tools"] = [INTENT_DISPATCH_TOOL]
+        session_config["session"]["tool_choice"] = "auto"
     safety_identity = hashlib.sha256(
         f"{profile or 'default'}:{session_id}".encode("utf-8")
     ).hexdigest()

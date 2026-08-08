@@ -1426,6 +1426,7 @@ export interface Translations {
     queueDelete: string
     queueStuckTitle: string
     queueStuckBody: string
+    voiceConversationFailed: string
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string

@@ -19,7 +19,11 @@ from tui_gateway import server
 
 def test_voice_session_create_uses_live_session_and_ensures_durable_row(monkeypatch):
     sid = "voice-ui-session"
-    session = {"session_key": "voice-stored-session"}
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "session_key": "voice-stored-session",
+    }
     ensured = []
     minted = []
 
@@ -28,8 +32,18 @@ def test_voice_session_create_uses_live_session_and_ensures_durable_row(monkeypa
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda value: ensured.append(value))
     monkeypatch.setattr(
         server,
+        "_get_db",
+        lambda: types.SimpleNamespace(
+            get_meta=lambda _key: None,
+            set_meta=lambda _key, _value: None,
+        ),
+    )
+    monkeypatch.setattr(
+        server,
         "mint_realtime_session",
-        lambda session_id, profile=None: minted.append((session_id, profile))
+        lambda session_id, profile=None, enable_intent_dispatch=False: minted.append(
+            (session_id, profile, enable_intent_dispatch)
+        )
         or {
             "client_secret": "ek_ephemeral",
             "expires_at": 1_800_000_000,
@@ -46,15 +60,1366 @@ def test_voice_session_create_uses_live_session_and_ensures_durable_row(monkeypa
         server._sessions.pop(sid, None)
 
     assert ensured == [session]
-    assert minted == [("voice-stored-session", "default")]
+    assert minted == [("voice-stored-session", "default", True)]
+    assert session["_voice_intent_grant"] == {
+        "active": True,
+        "expires_at": 1_800_000_000,
+        "provider_session_id": "sess-provider",
+    }
     assert response["result"] == {
         "client_secret": "ek_ephemeral",
         "expires_at": 1_800_000_000,
         "model": "gpt-realtime-2.1",
         "owner_session_id": "voice-ui-session",
+        "pending_intents": [],
+        "pending_results": [],
         "provider_session_id": "sess-provider",
         "session_id": "voice-stored-session",
     }
+
+
+def test_voice_intent_dispatch_is_default_off_without_a_live_grant():
+    sid = "voice-dispatch-ungranted"
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-ungranted",
+    }
+    server._sessions[sid] = session
+
+    try:
+        response = server._methods["voice.intent.dispatch"](
+            "voice-r1",
+            {
+                "call_id": "call-ungranted",
+                "intent": "Inspect the failing tests",
+                "item_id": "item-ungranted",
+                "session_id": sid,
+            },
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["error"]["code"] == 4012
+    assert "grant" in response["error"]["message"].lower()
+
+
+def test_voice_intent_dispatch_rejects_renderer_or_provider_session_key():
+    sid = "voice-dispatch-key-injection"
+    session = {
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-owned",
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "trusted-durable-key",
+    }
+    server._sessions[sid] = session
+
+    try:
+        response = server._methods["voice.intent.dispatch"](
+            "voice-r2",
+            {
+                "call_id": "call-key-injection",
+                "intent": "Run the focused tests",
+                "item_id": "item-key-injection",
+                "session_id": sid,
+                "session_key": "attacker-selected-key",
+            },
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["error"]["code"] == -32602
+
+
+def test_voice_intent_dispatch_queues_behind_busy_turn_without_interrupting():
+    sid = "voice-dispatch-busy"
+
+    class Agent:
+        def __init__(self):
+            self.interrupt_calls = 0
+
+        def interrupt(self):
+            self.interrupt_calls += 1
+
+    agent = Agent()
+    session = {
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-busy",
+        },
+        "agent": agent,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": True,
+        "session_key": "voice-stored-busy",
+    }
+    server._sessions[sid] = session
+
+    try:
+        response = server._methods["voice.intent.dispatch"](
+            "voice-r3",
+            {
+                "call_id": "call-busy",
+                "intent": "Run the durable verification suite",
+                "item_id": "item-busy",
+                "session_id": sid,
+            },
+        )
+        replay = server._methods["voice.intent.dispatch"](
+            "voice-r3-replay",
+            {
+                "call_id": "call-busy",
+                "intent": "Changed replay text must not enqueue again",
+                "item_id": "item-busy-replay",
+                "session_id": sid,
+            },
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"] == {
+        "correlation_id": "call-busy",
+        "status": "queued",
+    }
+    assert replay["result"] == response["result"]
+    assert agent.interrupt_calls == 0
+    assert session["_correlated_turn_queue"] == [
+        {
+            "correlation_id": "call-busy",
+            "source": "voice",
+            "text": "Run the durable verification suite",
+        }
+    ]
+
+
+def test_voice_intent_dispatch_rejects_fourth_nonterminal_turn_idempotently():
+    sid = "voice-dispatch-cap"
+
+    class Agent:
+        def __init__(self):
+            self.interrupt_calls = 0
+
+        def interrupt(self):
+            self.interrupt_calls += 1
+
+    agent = Agent()
+    original_queue = [
+        {"correlation_id": "call-1", "source": "voice", "text": "First"},
+        {"correlation_id": "call-2", "source": "voice", "text": "Second"},
+        {"correlation_id": "call-3", "source": "voice", "text": "Third"},
+    ]
+    session = {
+        "_correlated_turn_queue": list(original_queue),
+        "_correlated_turns": {
+            "call-1": {"status": "running"},
+            "call-2": {"status": "queued"},
+            "call-3": {"status": "queued"},
+            "call-complete": {"status": "completed"},
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-cap",
+        },
+        "agent": agent,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": True,
+        "session_key": "voice-stored-cap",
+    }
+    server._sessions[sid] = session
+    request = {
+        "call_id": "call-4",
+        "intent": "Fourth must not enter the canonical queue",
+        "item_id": "item-4",
+        "session_id": sid,
+    }
+
+    try:
+        first = server._methods["voice.intent.dispatch"]("voice-cap-1", request)
+        replay = server._methods["voice.intent.dispatch"]("voice-cap-2", request)
+    finally:
+        server._sessions.pop(sid, None)
+
+    expected = {"correlation_id": "call-4", "status": "rejected"}
+    assert first["result"] == expected
+    assert replay["result"] == expected
+    assert session["_correlated_turn_queue"] == original_queue
+    rejected = session["_correlated_turns"]["call-4"]
+    assert rejected["status"] == "rejected"
+    assert isinstance(rejected["rejected_at"], float)
+    assert agent.interrupt_calls == 0
+
+
+def test_voice_intent_dispatch_starts_idle_correlated_turn(monkeypatch):
+    sid = "voice-dispatch-idle"
+    scheduled = []
+    events = []
+    persisted = {}
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-idle",
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-idle",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_correlated_turn",
+        lambda rid, owner_sid, owner, entry: scheduled.append(
+            (rid, owner_sid, owner, entry)
+        ),
+        raising=False,
+    )
+
+    try:
+        response = server._methods["voice.intent.dispatch"](
+            "voice-r4",
+            {
+                "call_id": "call-idle",
+                "intent": "Inspect the release blocker",
+                "item_id": "item-idle",
+                "session_id": sid,
+            },
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"] == {
+        "correlation_id": "call-idle",
+        "status": "queued",
+    }
+    assert session["running"] is True
+    assert session["_correlated_turn_queue"] == []
+    assert session["_correlated_turns"]["call-idle"]["status"] == "running"
+    progress = [payload for event, owner, payload in events if event == "voice.intent.progress"]
+    assert progress == [
+        {"correlation_id": "call-idle", "status": "queued"},
+        {"correlation_id": "call-idle", "status": "running"},
+    ]
+    assert all(set(payload) == {"correlation_id", "status"} for payload in progress)
+    stored = json.loads(persisted["voice-intents:voice-stored-idle"])["call-idle"]
+    assert isinstance(stored["queued_at"], float)
+    assert isinstance(stored["running_at"], float)
+    assert "Inspect the release blocker" not in json.dumps(progress)
+    assert scheduled == [
+        (
+            "voice-r4",
+            sid,
+            session,
+            {
+                "correlation_id": "call-idle",
+                "source": "voice",
+                "text": "Inspect the release blocker",
+            },
+        )
+    ]
+
+
+def test_voice_intent_status_is_correlation_scoped_to_live_grant():
+    sid = "voice-dispatch-status"
+    session = {
+        "_correlated_turns": {"call-status": {"status": "running"}},
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-status",
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": True,
+        "session_key": "voice-stored-status",
+    }
+    server._sessions[sid] = session
+
+    try:
+        response = server._methods["voice.intent.status"](
+            "voice-r5",
+            {"call_id": "call-status", "session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"] == {
+        "correlation_id": "call-status",
+        "status": "running",
+    }
+
+
+def test_voice_intent_approval_pending_is_persisted_and_state_only(monkeypatch):
+    sid = "voice-approval-progress"
+    persisted = {}
+    events = []
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_active_correlated_turn_id": "call-approval",
+        "_correlated_turns": {"call-approval": {"status": "running"}},
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": True,
+        "session_key": "voice-stored-approval",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    try:
+        server._emit_approval_request(
+            sid,
+            {"command": "printf approval-details", "allow_permanent": False},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    state = session["_correlated_turns"]["call-approval"]
+    assert state["status"] == "approval_pending"
+    assert isinstance(state["approval_pending_at"], float)
+    progress = next(payload for event, owner, payload in events if event == "voice.intent.progress")
+    assert progress == {"correlation_id": "call-approval", "status": "approval_pending"}
+    assert "command" not in progress
+    stored = json.loads(persisted["voice-intents:voice-stored-approval"])
+    assert stored["call-approval"]["status"] == "approval_pending"
+    assert server._pending_voice_progress_payloads(session) == [
+        {"correlation_id": "call-approval", "status": "approval_pending"}
+    ]
+    assert any(event == "approval.request" for event, owner, payload in events)
+
+
+def test_voice_intent_pending_replays_completed_result_until_owner_consumes_it(monkeypatch):
+    sid = "voice-result-recovery"
+    provider_session_id = "provider-result-recovery"
+    session = {
+        "_correlated_turns": {"call-recovery": {"status": "running"}},
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-result-recovery",
+    }
+    events = []
+    persisted = {}
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    try:
+        server._set_correlated_turn_status(
+            session,
+            "call-recovery",
+            "completed",
+            result_text="Recovered verified result.",
+            sid=sid,
+        )
+        terminal = next(payload for event, owner, payload in events if event == "voice.intent.terminal")
+
+        pending = server._methods["voice.intent.pending"](
+            "voice-pending-r1",
+            {"session_id": sid},
+        )
+        assert pending["result"] == {
+            "results": [
+                {
+                    "correlation_id": "call-recovery",
+                    "delivery_id": terminal["delivery_id"],
+                    "provider_session_id": provider_session_id,
+                    "status": "completed",
+                    "text": "Recovered verified result.",
+                    "truncated": False,
+                }
+            ]
+        }
+
+        consumed = server._methods["voice.intent.ack"](
+            "voice-ack-r1",
+            {
+                "call_id": "call-recovery",
+                "delivery_id": terminal["delivery_id"],
+                "provider_session_id": provider_session_id,
+                "session_id": sid,
+                "stage": "consumed",
+            },
+        )
+        replay = server._methods["voice.intent.ack"](
+            "voice-ack-r2",
+            {
+                "call_id": "call-recovery",
+                "delivery_id": terminal["delivery_id"],
+                "provider_session_id": provider_session_id,
+                "session_id": sid,
+                "stage": "consumed",
+            },
+        )
+        after_ack = server._methods["voice.intent.pending"](
+            "voice-pending-r2",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    expected_ack = {
+        "correlation_id": "call-recovery",
+        "delivery_id": terminal["delivery_id"],
+        "stage": "consumed",
+    }
+    assert consumed["result"] == expected_ack
+    assert replay["result"] == expected_ack
+    assert after_ack["result"] == {"results": []}
+    assert session["_correlated_turns"]["call-recovery"]["delivery_stage"] == "consumed"
+
+
+def test_voice_terminal_is_not_published_when_state_persistence_fails(monkeypatch):
+    sid = "voice-terminal-persistence-failure"
+    events = []
+
+    class FailingDB:
+        def set_meta(self, _key, _value):
+            raise OSError("simulated terminal persistence failure")
+
+    session = {
+        "_correlated_turns": {},
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-terminal-persistence-failure",
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: FailingDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    server._set_correlated_turn_status(
+        session,
+        "call-terminal-persistence",
+        "completed",
+        result_text="Verified terminal result.",
+        sid=sid,
+    )
+
+    assert events == []
+    state = session["_correlated_turns"]["call-terminal-persistence"]
+    assert state["terminal_emitted"] is False
+
+
+def test_voice_intent_ack_fails_closed_until_stage_persistence_succeeds(monkeypatch):
+    sid = "voice-ack-persistence-failure"
+    provider_session_id = "provider-ack-persistence-failure"
+
+    class FailingDB:
+        def set_meta(self, _key, _value):
+            raise OSError("simulated voice ACK persistence failure")
+
+    persisted = {}
+
+    class WorkingDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_correlated_turns": {
+            "call-ack-persistence": {
+                "delivery_id": "delivery-ack-persistence",
+                "delivery_provider_session_id": provider_session_id,
+                "delivery_stage": "pending",
+                "result_text": "Verified durable result.",
+                "status": "completed",
+            }
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-ack-persistence-failure",
+    }
+    params = {
+        "call_id": "call-ack-persistence",
+        "delivery_id": "delivery-ack-persistence",
+        "provider_session_id": provider_session_id,
+        "session_id": sid,
+        "stage": "consumed",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FailingDB())
+
+    try:
+        failed = server._methods["voice.intent.ack"]("ack-persistence-failed", params)
+        monkeypatch.setattr(server, "_get_db", lambda: WorkingDB())
+        retried = server._methods["voice.intent.ack"]("ack-persistence-retried", params)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert failed["error"]["code"] == 5000
+    assert "durably" in failed["error"]["message"]
+    assert retried["result"]["stage"] == "consumed"
+    assert "voice-intents:voice-stored-ack-persistence-failure" in persisted
+
+
+def test_voice_intent_exhaustion_fails_closed_until_persistence_succeeds(monkeypatch):
+    sid = "voice-exhaustion-persistence-failure"
+    provider_session_id = "provider-exhaustion-persistence-failure"
+
+    class FailingDB:
+        def set_meta(self, _key, _value):
+            raise OSError("simulated voice exhaustion persistence failure")
+
+    persisted = {}
+
+    class WorkingDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    state = {
+        "delivery_attempt": 2,
+        "delivery_id": "delivery-exhaustion-persistence",
+        "delivery_kind": "retry",
+        "delivery_provider_session_id": provider_session_id,
+        "delivery_stage": "narration_failed",
+        "result_text": "Verified exhausted result.",
+        "status": "completed",
+    }
+    session = {
+        "_correlated_turns": {"call-exhaustion-persistence": state},
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-exhaustion-persistence-failure",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FailingDB())
+
+    try:
+        failed = server._methods["voice.intent.pending"](
+            "pending-exhaustion-persistence-failed", {"session_id": sid}
+        )
+        monkeypatch.setattr(server, "_get_db", lambda: WorkingDB())
+        retried = server._methods["voice.intent.pending"](
+            "pending-exhaustion-persistence-retried", {"session_id": sid}
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert failed["error"]["code"] == 5000
+    assert "durably" in failed["error"]["message"]
+    assert retried["result"] == {"results": []}
+    assert state["delivery_exhausted"] is True
+    assert "voice-intents:voice-stored-exhaustion-persistence-failure" in persisted
+
+
+def test_voice_intent_ack_tracks_narration_retry_and_rejects_retired_attempt(monkeypatch):
+    sid = "voice-narration-lifecycle"
+    provider_session_id = "provider-narration-lifecycle"
+    first_delivery_id = "delivery-narration-first"
+    persisted = {}
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_correlated_turns": {
+            "call-narration": {
+                "delivery_id": first_delivery_id,
+                "delivery_provider_session_id": provider_session_id,
+                "delivery_stage": "pending",
+                "result_text": "Verified narration result.",
+                "result_truncated": False,
+                "status": "completed",
+            }
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-narration-lifecycle",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    def ack(delivery_id, stage):
+        return server._methods["voice.intent.ack"](
+            f"ack-{stage}",
+            {
+                "call_id": "call-narration",
+                "delivery_id": delivery_id,
+                "provider_session_id": provider_session_id,
+                "session_id": sid,
+                "stage": stage,
+            },
+        )
+
+    try:
+        assert ack(first_delivery_id, "consumed")["result"]["stage"] == "consumed"
+        assert ack(first_delivery_id, "narration_started")["result"]["stage"] == "narration_started"
+        assert ack(first_delivery_id, "consumed")["result"]["stage"] == "narration_started"
+        assert ack(first_delivery_id, "narration_interrupted")["result"]["stage"] == "narration_interrupted"
+
+        retry = server._methods["voice.intent.pending"](
+            "pending-after-interruption",
+            {"session_id": sid},
+        )["result"]["results"]
+        assert len(retry) == 1
+        retry_delivery_id = retry[0]["delivery_id"]
+        assert retry_delivery_id != first_delivery_id
+
+        late = ack(first_delivery_id, "narration_completed")
+        assert late["error"]["code"] == 4004
+
+        assert ack(retry_delivery_id, "consumed")["result"]["stage"] == "consumed"
+        assert ack(retry_delivery_id, "narration_started")["result"]["stage"] == "narration_started"
+        completed = ack(retry_delivery_id, "narration_completed")
+        duplicate = ack(retry_delivery_id, "narration_completed")
+        delayed_started = ack(retry_delivery_id, "narration_started")
+        after_completion = server._methods["voice.intent.pending"](
+            "pending-after-completion",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert completed["result"]["stage"] == "narration_completed"
+    assert duplicate["result"] == completed["result"]
+    assert delayed_started["result"] == completed["result"]
+    assert after_completion["result"] == {"results": []}
+    state = session["_correlated_turns"]["call-narration"]
+    assert state["delivery_stage"] == "narration_completed"
+    assert state["ack_provider_session_id"] == provider_session_id
+    assert isinstance(state["consumed_at"], float)
+    assert isinstance(state["narration_started_at"], float)
+    assert isinstance(state["narration_completed_at"], float)
+    assert first_delivery_id not in persisted["voice-intents:voice-stored-narration-lifecycle"]
+
+
+def test_voice_intent_ack_allows_prebinding_failure_from_consumed(monkeypatch):
+    sid = "voice-prebinding-failure"
+    provider_session_id = "provider-prebinding-failure"
+
+    class FakeDB:
+        def set_meta(self, _key, _value):
+            pass
+
+    session = {
+        "_correlated_turns": {
+            "call-prebinding": {
+                "delivery_id": "delivery-prebinding",
+                "delivery_provider_session_id": provider_session_id,
+                "delivery_stage": "pending",
+                "result_text": "Verified result.",
+                "result_truncated": False,
+                "status": "completed",
+            }
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-prebinding-failure",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    def ack(stage):
+        return server._methods["voice.intent.ack"](
+            f"ack-prebinding-{stage}",
+            {
+                "call_id": "call-prebinding",
+                "delivery_id": "delivery-prebinding",
+                "provider_session_id": provider_session_id,
+                "session_id": sid,
+                "stage": stage,
+            },
+        )
+
+    try:
+        assert ack("consumed")["result"]["stage"] == "consumed"
+        assert ack("narration_failed")["result"]["stage"] == "narration_failed"
+        retry = server._methods["voice.intent.pending"](
+            "pending-after-prebinding-failure",
+            {"session_id": sid},
+        )["result"]["results"]
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert len(retry) == 1
+    assert retry[0]["correlation_id"] == "call-prebinding"
+    assert retry[0]["delivery_id"] != "delivery-prebinding"
+
+
+def test_voice_intent_pending_allows_only_one_narration_remint(monkeypatch):
+    sid = "voice-narration-remint-cap"
+    provider_session_id = "provider-narration-remint-cap"
+    persisted = {}
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_correlated_turns": {
+            "call-cap": {
+                "delivery_id": "delivery-initial",
+                "delivery_provider_session_id": provider_session_id,
+                "delivery_stage": "pending",
+                "result_text": "Verified result.",
+                "result_truncated": False,
+                "status": "completed",
+            }
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": provider_session_id,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-narration-remint-cap",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    def ack(delivery_id, stage):
+        return server._methods["voice.intent.ack"](
+            f"ack-{delivery_id}-{stage}",
+            {
+                "call_id": "call-cap",
+                "delivery_id": delivery_id,
+                "provider_session_id": provider_session_id,
+                "session_id": sid,
+                "stage": stage,
+            },
+        )
+
+    try:
+        ack("delivery-initial", "consumed")
+        ack("delivery-initial", "narration_started")
+        ack("delivery-initial", "narration_failed")
+        first_retry = server._methods["voice.intent.pending"](
+            "pending-first-retry", {"session_id": sid}
+        )["result"]["results"]
+        assert len(first_retry) == 1
+
+        retry_delivery_id = first_retry[0]["delivery_id"]
+        ack(retry_delivery_id, "consumed")
+        ack(retry_delivery_id, "narration_started")
+        ack(retry_delivery_id, "narration_failed")
+        after_budget = server._methods["voice.intent.pending"](
+            "pending-after-budget", {"session_id": sid}
+        )["result"]["results"]
+        session["_voice_intent_grant"]["provider_session_id"] = "provider-after-exhaustion"
+        after_reconnect = server._methods["voice.intent.pending"](
+            "pending-after-exhaustion-reconnect", {"session_id": sid}
+        )["result"]["results"]
+    finally:
+        server._sessions.pop(sid, None)
+
+    state = session["_correlated_turns"]["call-cap"]
+    assert after_budget == []
+    assert after_reconnect == []
+    assert state["delivery_attempt"] == 2
+    assert state["delivery_exhausted"] is True
+
+
+def test_voice_intent_reconnect_gets_one_recovery_without_a_retry_budget(monkeypatch):
+    sid = "voice-narration-reconnect-cap"
+    original_provider = "provider-before-reconnect"
+    recovery_provider = "provider-recovery"
+    persisted = {}
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_correlated_turns": {
+            "call-recovery-cap": {
+                "delivery_id": "delivery-before-reconnect",
+                "delivery_provider_session_id": original_provider,
+                "delivery_stage": "pending",
+                "delivery_attempt": 1,
+                "delivery_kind": "initial",
+                "result_text": "Recovered result.",
+                "result_truncated": False,
+                "status": "completed",
+            }
+        },
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": recovery_provider,
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-reconnect-cap",
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    def ack(delivery_id, stage):
+        return server._methods["voice.intent.ack"](
+            f"ack-recovery-{stage}",
+            {
+                "call_id": "call-recovery-cap",
+                "delivery_id": delivery_id,
+                "provider_session_id": recovery_provider,
+                "session_id": sid,
+                "stage": stage,
+            },
+        )
+
+    try:
+        recovery = server._methods["voice.intent.pending"](
+            "pending-recovery", {"session_id": sid}
+        )["result"]["results"]
+        assert len(recovery) == 1
+        recovery_delivery_id = recovery[0]["delivery_id"]
+        ack(recovery_delivery_id, "consumed")
+        ack(recovery_delivery_id, "narration_started")
+        ack(recovery_delivery_id, "narration_failed")
+        after_failure = server._methods["voice.intent.pending"](
+            "pending-after-recovery-failure", {"session_id": sid}
+        )["result"]["results"]
+        session["_voice_intent_grant"]["provider_session_id"] = "provider-third"
+        after_second_reconnect = server._methods["voice.intent.pending"](
+            "pending-after-second-reconnect", {"session_id": sid}
+        )["result"]["results"]
+    finally:
+        server._sessions.pop(sid, None)
+
+    state = session["_correlated_turns"]["call-recovery-cap"]
+    assert after_failure == []
+    assert after_second_reconnect == []
+    assert state["delivery_attempt"] == 2
+    assert state["delivery_kind"] == "recovery"
+    assert state["delivery_recovery_used"] is True
+    assert state["delivery_exhausted"] is True
+
+
+def test_voice_session_create_recovers_unconsumed_result_from_durable_state(monkeypatch):
+    sid = "voice-runtime-after-restart"
+    stored_session_id = "voice-stored-after-restart"
+    new_provider_session_id = "provider-after-restart"
+    stored = {
+        "call-before-restart": {
+            "delivery_id": "delivery-before-restart",
+            "delivery_provider_session_id": "provider-before-restart",
+            "delivery_stage": "pending",
+            "result_text": "Durable verified result.",
+            "result_truncated": False,
+            "status": "completed",
+        }
+    }
+    persisted = {}
+
+    class FakeDB:
+        def get_meta(self, key):
+            assert key == f"voice-intents:{stored_session_id}"
+            return json.dumps(stored)
+
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": stored_session_id,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda owner: None)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        server,
+        "mint_realtime_session",
+        lambda session_id, profile=None, enable_intent_dispatch=False: {
+            "client_secret": "ek_recovery",
+            "expires_at": time.time() + 60,
+            "model": "gpt-realtime-2.1",
+            "provider_session_id": new_provider_session_id,
+            "session_id": session_id,
+        },
+    )
+
+    try:
+        response = server._methods["voice.session.create"](
+            "voice-create-after-restart",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    pending = response["result"]["pending_results"]
+    assert len(pending) == 1
+    assert pending[0] == {
+        "correlation_id": "call-before-restart",
+        "delivery_id": pending[0]["delivery_id"],
+        "provider_session_id": new_provider_session_id,
+        "status": "completed",
+        "text": "Durable verified result.",
+        "truncated": False,
+    }
+    assert pending[0]["delivery_id"] != "delivery-before-restart"
+    rebound = json.loads(persisted[f"voice-intents:{stored_session_id}"])
+    assert rebound["call-before-restart"]["delivery_id"] == pending[0]["delivery_id"]
+    assert (
+        rebound["call-before-restart"]["delivery_provider_session_id"]
+        == new_provider_session_id
+    )
+    assert session["_correlated_turns"]["call-before-restart"]["status"] == "completed"
+    assert session.get("_correlated_turn_queue", []) == []
+    assert session["running"] is False
+
+
+def test_voice_session_create_persists_legacy_retry_exhaustion_without_rebinding(monkeypatch):
+    sid = "voice-runtime-legacy-exhausted"
+    stored_session_id = "voice-stored-legacy-exhausted"
+    stored = {
+        "call-legacy-exhausted": {
+            "delivery_id": "delivery-legacy-retry",
+            "delivery_provider_session_id": "provider-before-restart",
+            "delivery_stage": "narration_failed",
+            "delivery_attempt": 2,
+            "delivery_kind": "retry",
+            "result_text": "Already exhausted result.",
+            "result_truncated": False,
+            "status": "completed",
+        }
+    }
+    persisted = {}
+
+    class FakeDB:
+        def get_meta(self, key):
+            assert key == f"voice-intents:{stored_session_id}"
+            return json.dumps(stored)
+
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": stored_session_id,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda owner: None)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        server,
+        "mint_realtime_session",
+        lambda session_id, profile=None, enable_intent_dispatch=False: {
+            "client_secret": "ek_legacy_exhausted",
+            "expires_at": time.time() + 60,
+            "model": "gpt-realtime-2.1",
+            "provider_session_id": "provider-after-restart",
+            "session_id": session_id,
+        },
+    )
+
+    try:
+        response = server._methods["voice.session.create"](
+            "voice-create-legacy-exhausted",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["pending_results"] == []
+    state = session["_correlated_turns"]["call-legacy-exhausted"]
+    assert state["delivery_attempt"] == 2
+    assert state["delivery_exhausted"] is True
+    durable = json.loads(persisted[f"voice-intents:{stored_session_id}"])
+    assert durable["call-legacy-exhausted"]["delivery_attempt"] == 2
+    assert durable["call-legacy-exhausted"]["delivery_exhausted"] is True
+
+
+def test_correlated_result_is_redacted_before_persist_and_emit(monkeypatch):
+    sid = "voice-redacted-result"
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    persisted = {}
+    events = []
+
+    class FakeDB:
+        def set_meta(self, key, value):
+            persisted[key] = value
+
+    session = {
+        "_correlated_turns": {"call-redacted": {"status": "running"}},
+        "_voice_intent_grant": {
+            "active": True,
+            "expires_at": time.time() + 60,
+            "provider_session_id": "provider-redacted",
+        },
+        "history": [],
+        "history_lock": threading.RLock(),
+        "running": False,
+        "session_key": "voice-stored-redacted",
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    server._set_correlated_turn_status(
+        session,
+        "call-redacted",
+        "completed",
+        result_text=f"Authorization: Bearer {secret}",
+        sid=sid,
+    )
+
+    state = session["_correlated_turns"]["call-redacted"]
+    assert secret not in state["result_text"]
+    assert secret not in persisted["voice-intents:voice-stored-redacted"]
+    terminal_payload = next(
+        payload for event, owner, payload in events if event == "voice.intent.terminal"
+    )
+    assert terminal_payload["text"] == state["result_text"]
+    assert secret not in terminal_payload["text"]
+
+def test_correlated_turn_emits_visible_terminal_result_once_after_message_complete(monkeypatch):
+    events = []
+    canonical_runs = []
+
+    class SyncThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    def run_conversation(*args, **kwargs):
+        canonical_runs.append((args, kwargs))
+        return {
+            "final_response": "The verification passed.",
+            "messages": [
+                {"role": "user", "content": "Run the verification"},
+                {"role": "assistant", "content": "The verification passed."},
+            ],
+        }
+
+    agent = types.SimpleNamespace(run_conversation=run_conversation)
+    session = _session(
+        agent=agent,
+        history=[],
+        history_version=0,
+        running=True,
+        _correlated_turns={"call-terminal": {"status": "running"}},
+    )
+    server._sessions["voice-terminal"] = session
+    monkeypatch.setattr(server.threading, "Thread", SyncThread)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: types.SimpleNamespace(set_meta=lambda _key, _value: None),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    try:
+        server._run_prompt_submit(
+            "voice-terminal-rid",
+            "voice-terminal",
+            session,
+            "Run the verification",
+            correlation_id="call-terminal",
+        )
+        server._set_correlated_turn_status(
+            session,
+            "call-terminal",
+            "completed",
+            result_text="The verification passed.",
+        )
+    finally:
+        server._sessions.pop("voice-terminal", None)
+
+    message_index = next(i for i, event in enumerate(events) if event[0] == "message.complete")
+    terminal_events = [event for event in events if event[0] == "voice.intent.terminal"]
+    terminal_index = next(i for i, event in enumerate(events) if event[0] == "voice.intent.terminal")
+
+    assert message_index < terminal_index
+    assert len(canonical_runs) == 1
+    assert len(terminal_events) == 1
+    event_type, owner, payload = terminal_events[0]
+    assert event_type == "voice.intent.terminal"
+    assert owner == "voice-terminal"
+    assert payload == {
+        "correlation_id": "call-terminal",
+        "delivery_id": payload["delivery_id"],
+        "provider_session_id": None,
+        "status": "completed",
+        "text": "The verification passed.",
+        "truncated": False,
+    }
+    state = session["_correlated_turns"]["call-terminal"]
+    assert state["terminal_emitted"] is True
+    assert state["delivery_stage"] == "pending"
+    assert "terminal_delivered" not in state
+
+
+def test_correlated_realtime_turn_does_not_invoke_generic_tts_after_grant_expiry(monkeypatch):
+    spoken = []
+
+    class SyncThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            assert self.target is not None
+            self.target(*self.args)
+
+        def is_alive(self):
+            return False
+
+    agent = types.SimpleNamespace(
+        run_conversation=lambda *args, **kwargs: {
+            "final_response": "The verified result.",
+            "messages": [
+                {"role": "user", "content": "Run verification"},
+                {"role": "assistant", "content": "The verified result."},
+            ],
+        }
+    )
+    session = _session(
+        agent=agent,
+        history=[],
+        history_version=0,
+        running=True,
+        _correlated_turns={"call-audio-owner": {"status": "running"}},
+        _voice_intent_grant={
+            "active": True,
+            "expires_at": time.time() - 1,
+            "provider_session_id": "provider-audio-owner",
+        },
+    )
+    server._sessions["voice-audio-owner"] = session
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+    monkeypatch.setattr(server.threading, "Thread", SyncThread)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(speak_text=lambda text: spoken.append(text)),
+    )
+
+    try:
+        server._run_prompt_submit(
+            "voice-audio-owner-rid",
+            "voice-audio-owner",
+            session,
+            "Run verification",
+            correlation_id="call-audio-owner",
+        )
+    finally:
+        server._sessions.pop("voice-audio-owner", None)
+
+    assert spoken == []
+
+
+def test_correlated_turn_dispatcher_exception_emits_failed_progress(monkeypatch):
+    events = []
+
+    class SyncThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            assert self.target is not None
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    def run_conversation(*args, **kwargs):
+        raise RuntimeError("synthetic correlated dispatcher failure")
+
+    session = _session(
+        agent=types.SimpleNamespace(run_conversation=run_conversation),
+        history=[],
+        history_version=0,
+        running=True,
+        _correlated_turns={"call-failed": {"status": "running"}},
+    )
+    server._sessions["voice-failed"] = session
+    monkeypatch.setattr(server.threading, "Thread", SyncThread)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: types.SimpleNamespace(set_meta=lambda _key, _value: None),
+    )
+    monkeypatch.setattr(server, "_transition_session_idle", lambda _session: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    try:
+        server._run_prompt_submit(
+            "voice-failed-rid",
+            "voice-failed",
+            session,
+            "Run the failing verification",
+            correlation_id="call-failed",
+        )
+    finally:
+        server._sessions.pop("voice-failed", None)
+
+    assert session["_correlated_turns"]["call-failed"]["status"] == "failed"
+    assert (
+        "voice.intent.progress",
+        "voice-failed",
+        {"correlation_id": "call-failed", "status": "failed"},
+    ) in events
+
+
+def test_correlated_turn_does_not_narrate_history_mismatch(monkeypatch):
+    events = []
+
+    class SyncThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            assert self.target is not None
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    session = _session(
+        history=[],
+        history_version=0,
+        running=True,
+        _correlated_turns={"call-mismatch": {"status": "running"}},
+    )
+
+    def run_conversation(*args, **kwargs):
+        session["history_version"] = 1
+        return {
+            "final_response": "Unpersisted result must not be narrated.",
+            "messages": [
+                {"role": "user", "content": "Run the verification"},
+                {"role": "assistant", "content": "Unpersisted result must not be narrated."},
+            ],
+        }
+
+    session["agent"] = types.SimpleNamespace(run_conversation=run_conversation)
+    server._sessions["voice-mismatch"] = session
+    monkeypatch.setattr(server.threading, "Thread", SyncThread)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_transition_session_idle", lambda _session: None)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload=None: events.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    try:
+        server._run_prompt_submit(
+            "voice-mismatch-rid",
+            "voice-mismatch",
+            session,
+            "Run the verification",
+            correlation_id="call-mismatch",
+        )
+    finally:
+        server._sessions.pop("voice-mismatch", None)
+
+    assert any(event[0] == "message.complete" for event in events)
+    assert not any(event[0] == "voice.intent.terminal" for event in events)
+    assert session["_correlated_turns"]["call-mismatch"]["status"] == "completed"
+    assert session["_correlated_turns"]["call-mismatch"].get("terminal_delivered") is not True
 
 
 def test_voice_transcript_append_persists_emits_and_deduplicates(monkeypatch):

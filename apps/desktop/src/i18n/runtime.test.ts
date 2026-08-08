@@ -24,6 +24,10 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('assistant.tool.statusRecovered')).toBe('已恢复')
   })
 
+  it('uses a distinct title for realtime voice conversation failures', () => {
+    expect(translateNow('composer.voiceConversationFailed')).toBe('Voice conversation ended')
+  })
+
   it('passes arguments to function translations', () => {
     expect(translateNow('notifications.updateReadyMessage', 2)).toBe('2 new changes available.')
   })

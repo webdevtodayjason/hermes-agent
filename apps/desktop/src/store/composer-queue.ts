@@ -7,11 +7,63 @@ export interface QueuedPromptEntry {
   text: string
   attachments: ComposerAttachment[]
   queuedAt: number
+  source?: 'typed' | 'voice'
 }
 
 type QueueState = Record<string, QueuedPromptEntry[]>
 
 const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const inFlightQueuedPromptIds = new Set<string>()
+
+/**
+ * Mark a queue entry as claimed by the drain loop. This state is deliberately
+ * process-local: a restart must recover every persisted entry as pending.
+ */
+export const setQueuedPromptInFlight = (id: null | string | undefined, inFlight: boolean) => {
+  if (!id) {
+    return
+  }
+
+  if (inFlight) {
+    inFlightQueuedPromptIds.add(id)
+
+    return
+  }
+
+  inFlightQueuedPromptIds.delete(id)
+
+  for (const [sid, queue] of Object.entries($queuedPromptsBySession.get())) {
+    const releasedIndex = queue.findIndex(entry => entry.id === id)
+    const released = queue[releasedIndex]
+
+    if (releasedIndex < 0 || released?.source !== 'voice') {
+      continue
+    }
+
+    let mergedText = released.text.trimEnd()
+
+    const next = queue.filter((entry, index) => {
+      if (
+        index <= releasedIndex ||
+        entry.source !== 'voice' ||
+        inFlightQueuedPromptIds.has(entry.id)
+      ) {
+        return true
+      }
+
+      mergedText = `${mergedText} ${entry.text.trimStart()}`
+
+      return false
+    })
+
+    if (next.length !== queue.length) {
+      next[releasedIndex] = { ...released, text: mergedText }
+      writeSession(sid, next)
+    }
+
+    return
+  }
+}
 
 const load = (): QueueState => {
   if (typeof window === 'undefined') {
@@ -80,7 +132,7 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: { text: string; attachments: ComposerAttachment[] }
+  payload: { text: string; attachments: ComposerAttachment[]; source?: 'typed' | 'voice' }
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
@@ -88,14 +140,42 @@ export const enqueueQueuedPrompt = (
     return null
   }
 
+  const queue = queueFor(sid)
+
+  if (payload.source === 'voice') {
+    const existingIndex = queue.findIndex(
+      entry => entry.source === 'voice' && !inFlightQueuedPromptIds.has(entry.id)
+    )
+
+    if (existingIndex >= 0) {
+      const existing = queue[existingIndex]
+
+      if (!existing) {
+        return null
+      }
+
+      const merged: QueuedPromptEntry = {
+        ...existing,
+        text: `${existing.text.trimEnd()} ${payload.text.trimStart()}`
+      }
+
+      const next = [...queue]
+      next[existingIndex] = merged
+      writeSession(sid, next)
+
+      return merged
+    }
+  }
+
   const entry: QueuedPromptEntry = {
     id: nextId(),
     text: payload.text,
     attachments: cloneAttachments(payload.attachments),
-    queuedAt: Date.now()
+    queuedAt: Date.now(),
+    ...(payload.source ? { source: payload.source } : {})
   }
 
-  writeSession(sid, [...queueFor(sid), entry])
+  writeSession(sid, [...queue, entry])
 
   return entry
 }
@@ -114,6 +194,7 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
   }
 
   writeSession(sid, rest)
+  inFlightQueuedPromptIds.delete(head.id)
 
   return head
 }
@@ -133,6 +214,7 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
   }
 
   writeSession(sid, next)
+  inFlightQueuedPromptIds.delete(id)
 
   return true
 }
@@ -204,6 +286,10 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
 
   if (!sid || !(sid in $queuedPromptsBySession.get())) {
     return
+  }
+
+  for (const entry of queueFor(sid)) {
+    inFlightQueuedPromptIds.delete(entry.id)
   }
 
   writeSession(sid, [])
